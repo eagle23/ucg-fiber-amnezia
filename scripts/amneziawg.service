@@ -1,0 +1,42 @@
+[Unit]
+Description=AmneziaWG kernel module
+After=network-pre.target
+Before=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# Check kernel version matches built module
+ExecStartPre=/bin/bash -c '\
+    EXPECTED=$(cat /data/amneziawg/.kernel-version 2>/dev/null || echo "unknown"); \
+    CURRENT=$(uname -r); \
+    if [ "$EXPECTED" != "$CURRENT" ]; then \
+        echo "Kernel changed: $EXPECTED -> $CURRENT. Module NOT loaded. Rebuild required." | logger -t amneziawg; \
+        exit 1; \
+    fi'
+
+# Load dependencies
+ExecStartPre=/sbin/modprobe udp_tunnel
+ExecStartPre=/sbin/modprobe ip6_udp_tunnel
+
+# Load AmneziaWG module
+ExecStart=/sbin/insmod /data/amneziawg/amneziawg.ko
+
+# Bring up configured interfaces
+ExecStartPost=/bin/bash -c '\
+    for conf in /data/amneziawg/*.conf; do \
+        [ -f "$conf" ] || continue; \
+        AWG=/data/amneziawg/awg bash /data/amneziawg/awg-quick up "$conf" || true; \
+    done'
+
+# Tear down interfaces on stop
+ExecStop=/bin/bash -c '\
+    for conf in /data/amneziawg/*.conf; do \
+        [ -f "$conf" ] || continue; \
+        AWG=/data/amneziawg/awg bash /data/amneziawg/awg-quick down "$conf" || true; \
+    done'
+ExecStop=/sbin/rmmod amneziawg
+
+[Install]
+WantedBy=multi-user.target

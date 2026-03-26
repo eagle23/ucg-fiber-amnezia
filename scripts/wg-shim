@@ -1,0 +1,788 @@
+#!/bin/sh
+set -eu
+
+find_binary() {
+	binary_name="$1"
+	shift
+	for candidate in "$@"; do
+		if [ -n "${candidate}" ] && [ -x "${candidate}" ]; then
+			printf '%s\n' "${candidate}"
+			return 0
+		fi
+	done
+	command -v "${binary_name}" 2>/dev/null || true
+}
+
+REAL_WG="${WG_SHIM_REAL:-/data/wg-shim/orig/wg}"
+AWG="${WG_SHIM_AWG:-/data/amneziawg/awg}"
+IP_BIN="${WG_SHIM_IP:-$(find_binary ip /usr/sbin/ip /usr/bin/ip /sbin/ip /bin/ip)}"
+MONGO_BIN="${WG_SHIM_MONGO:-$(find_binary mongo /usr/bin/mongo /bin/mongo /data/mongo/bin/mongo)}"
+MONGO_PORT="${WG_SHIM_MONGO_PORT:-27117}"
+MONGO_DB="${WG_SHIM_MONGO_DB:-ace}"
+STATE_DIR="${WG_SHIM_STATE_DIR:-/data/wg-shim}"
+CACHE_DIR="${WG_SHIM_CACHE_DIR:-${STATE_DIR}/cache}"
+ASSOC_DIR="${WG_SHIM_ASSOC_DIR:-${STATE_DIR}/iface-extra.d}"
+LOG_FILE="${WG_SHIM_LOG_FILE:-${STATE_DIR}/wg-shim.log}"
+LOG_ENABLED="${WG_SHIM_LOG_ENABLED:-1}"
+
+ensure_state_dirs() {
+	mkdir -p "${STATE_DIR}" "${CACHE_DIR}" "${ASSOC_DIR}"
+}
+
+require_exec() {
+	binary_path="$1"
+	binary_name="$2"
+	if [ -n "${binary_path}" ] && [ -x "${binary_path}" ]; then
+		return 0
+	fi
+	echo "wg-shim: ${binary_name} binary not found" >&2
+	return 127
+}
+
+log_message() {
+	if [ "${LOG_ENABLED}" != "1" ]; then
+		return 0
+	fi
+	ensure_state_dirs
+	{
+		printf '=== %s wg-shim %s\n' "$(date)" "$*"
+		printf 'pid=%s ppid=%s\n' "$$" "${PPID:-unknown}"
+		readlink "/proc/${PPID}/exe" 2>/dev/null || true
+		tr '\0' ' ' <"/proc/${PPID}/cmdline" 2>/dev/null || true
+		printf '\n'
+	} >>"${LOG_FILE}"
+}
+
+log_reason() {
+	if [ "${LOG_ENABLED}" != "1" ]; then
+		return 0
+	fi
+	ensure_state_dirs
+	printf '%s\n' "$*" >>"${LOG_FILE}"
+}
+
+assoc_file_for_iface() {
+	printf '%s/%s.meta\n' "${ASSOC_DIR}" "$1"
+}
+
+is_associated_iface() {
+	[ $# -eq 1 ] && [ -f "$(assoc_file_for_iface "$1")" ]
+}
+
+write_assoc_file() {
+	iface="$1"
+	wireguard_id="$2"
+	assoc_file="$(assoc_file_for_iface "${iface}")"
+
+	ensure_state_dirs
+	{
+		printf 'WIREGUARD_ID=%s\n' "${wireguard_id}"
+		printf 'IFACE=%s\n' "${iface}"
+	} >"${assoc_file}"
+	chmod 600 "${assoc_file}"
+}
+
+read_assoc_wireguard_id() {
+	iface="$1"
+	assoc_file="$(assoc_file_for_iface "${iface}")"
+
+	awk -F= '
+		$1 == "WIREGUARD_ID" {
+			sub(/^[^=]*=/, "", $0)
+			print $0
+			exit
+		}
+	' "${assoc_file}"
+}
+
+remove_assoc_file() {
+	rm -f "$(assoc_file_for_iface "$1")"
+}
+
+has_associated_ifaces() {
+	[ -d "${ASSOC_DIR}" ] && find "${ASSOC_DIR}" -type f -name '*.meta' -print -quit 2>/dev/null | grep -q .
+}
+
+extract_wireguard_id() {
+	iface="$1"
+	case "${iface}" in
+		wgclt[0-9]*)
+			printf '%s\n' "${iface#wgclt}"
+			return 0
+			;;
+		*)
+			return 1
+			;;
+	esac
+}
+
+is_awg_active_iface() {
+	if [ $# -ne 1 ]; then
+		return 1
+	fi
+	"${AWG}" show interfaces 2>/dev/null | tr ' ' '\n' | awk -v iface="$1" '
+		NF {
+			if ($1 == iface) {
+				found = 1
+				exit 0
+			}
+		}
+		END { exit(found ? 0 : 1) }
+	'
+}
+
+iface_exists() {
+	if [ $# -ne 1 ]; then
+		return 1
+	fi
+	require_exec "${IP_BIN}" ip >/dev/null
+	"${IP_BIN}" link show dev "$1" >/dev/null 2>&1
+}
+
+build_active_managed_file() {
+	output_file="$1"
+	active_file="$(mktemp)"
+	configured_file="$(mktemp)"
+
+	: >"${configured_file}"
+	if [ -d "${ASSOC_DIR}" ]; then
+		find "${ASSOC_DIR}" -type f -name '*.meta' -print 2>/dev/null | awk -F/ '
+			{
+				name = $NF
+				sub(/\.meta$/, "", name)
+				print name
+			}
+		' >"${configured_file}"
+	fi
+	"${AWG}" show interfaces 2>/dev/null | tr ' ' '\n' | awk 'NF { print $1 }' >"${active_file}"
+	if [ -s "${configured_file}" ]; then
+		awk '
+			NR == FNR {
+				managed[$1] = 1
+				next
+			}
+			NF && ($1 in managed) { print $1 }
+		' "${configured_file}" "${active_file}" | awk '!seen[$0]++' >"${output_file}"
+	else
+		: >"${output_file}"
+	fi
+	rm -f "${active_file}" "${configured_file}"
+}
+
+filter_dump_excluding_file() {
+	active_managed_file="$1"
+	if [ ! -s "${active_managed_file}" ]; then
+		cat
+		return 0
+	fi
+	awk '
+		NR == FNR {
+			managed[$1] = 1
+			next
+		}
+		!($1 in managed) { print }
+	' "${active_managed_file}" -
+}
+
+filter_dump_only_file() {
+	active_managed_file="$1"
+	if [ ! -s "${active_managed_file}" ]; then
+		return 0
+	fi
+	awk '
+		NR == FNR {
+			managed[$1] = 1
+			next
+		}
+		($1 in managed) { print }
+	' "${active_managed_file}" -
+}
+
+normalize_awg_dump_file() {
+	input_file="$1"
+	output_file="$2"
+	now_epoch="$(date +%s)"
+
+	awk -F '\t' -v OFS='\t' -v now_epoch="${now_epoch}" '
+		NF >= 6 && $2 != "(none)" && $3 != "(none)" && $4 ~ /^[0-9]+$/ {
+			print $1, $2, $3, "(none)", $4, $NF
+			next
+		}
+		NF >= 9 && $6 ~ /^[0-9]+$/ && $7 ~ /^[0-9]+$/ && $8 ~ /^[0-9]+$/ {
+			forced_value = (NF >= 10 && $10 ~ /^[0-9]+$/) ? $10 : (($6 + 0) > 0 ? now_epoch : 0)
+			print $1, $2, $3, $4, $5, $6, $7, $8, $9, forced_value
+			next
+		}
+		{ print }
+	' "${input_file}" >"${output_file}"
+}
+
+db_config_has_default_allowedips() {
+	config_file="$1"
+	family="$2"
+
+	awk -v family="${family}" '
+		/^AllowedIPs[[:space:]]*=/ {
+			if (family == "4" && $0 ~ /(^|[[:space:],])0\.0\.0\.0\/0($|[[:space:],])/) {
+				found = 1
+			}
+			if (family == "6" && $0 ~ /(^|[[:space:],])::\/0($|[[:space:],])/) {
+				found = 1
+			}
+		}
+		END { exit(found ? 0 : 1) }
+	' "${config_file}"
+}
+
+strip_prefix_length() {
+	value="$1"
+	printf '%s\n' "${value%%/*}"
+}
+
+find_lookup_table_for_iface() {
+	family="$1"
+	iface="$2"
+
+	"${IP_BIN}" "-${family}" rule show | awk -v iface="${iface}" '
+		$0 ~ ("lookup [^ ]*" iface "$") {
+			print $NF
+			exit
+		}
+	'
+}
+
+find_next_rule_pref() {
+	family="$1"
+
+	"${IP_BIN}" "-${family}" rule show | awk '
+		match($1, /^[0-9]+:/) {
+			value = $1
+			sub(/:$/, "", value)
+			if (value > max && value < 32765)
+				max = value
+		}
+		END {
+			if (max > 0)
+				print max + 1
+			else
+				print 32550
+		}
+	'
+}
+
+ensure_iface_policy_routing() {
+	iface="$1"
+	record_file="$2"
+	config_file="$3"
+	ipv4_cidr="$(db_meta_value "${record_file}" IPV4 || true)"
+	ipv6_cidr="$(db_meta_value "${record_file}" IPV6 || true)"
+	ipv4_addr=''
+	ipv6_addr=''
+	table4=''
+	table6=''
+	pref4=''
+	pref6=''
+	did_change='0'
+
+	require_exec "${IP_BIN}" ip >/dev/null
+
+	if [ -n "${ipv4_cidr}" ]; then
+		ipv4_addr="$(strip_prefix_length "${ipv4_cidr}")"
+		table4="$(find_lookup_table_for_iface 4 "${iface}" || true)"
+		if [ -n "${table4}" ] && db_config_has_default_allowedips "${config_file}" 4; then
+			"${IP_BIN}" -4 route replace default dev "${iface}" table "${table4}" scope link >/dev/null 2>&1 || true
+			did_change='1'
+			if ! "${IP_BIN}" -4 rule show | grep -Eq "from ${ipv4_addr}(/32)? lookup ${table4}$"; then
+				pref4="$(find_next_rule_pref 4)"
+				"${IP_BIN}" -4 rule add pref "${pref4}" from "${ipv4_addr}" lookup "${table4}" >/dev/null 2>&1 || true
+				did_change='1'
+			fi
+		fi
+	fi
+
+	if [ -n "${ipv6_cidr}" ]; then
+		ipv6_addr="$(strip_prefix_length "${ipv6_cidr}")"
+		table6="$(find_lookup_table_for_iface 6 "${iface}" || true)"
+		if [ -n "${table6}" ] && db_config_has_default_allowedips "${config_file}" 6; then
+			"${IP_BIN}" -6 route replace default dev "${iface}" table "${table6}" >/dev/null 2>&1 || true
+			did_change='1'
+			if ! "${IP_BIN}" -6 rule show | grep -Eq "from ${ipv6_addr}(/128)? lookup ${table6}$"; then
+				pref6="$(find_next_rule_pref 6)"
+				"${IP_BIN}" -6 rule add pref "${pref6}" from "${ipv6_addr}" lookup "${table6}" >/dev/null 2>&1 || true
+				did_change='1'
+			fi
+		fi
+	fi
+
+	if [ "${did_change}" = '1' ]; then
+		"${IP_BIN}" route flush cache >/dev/null 2>&1 || true
+	fi
+}
+
+repair_associated_iface_policy_routing() {
+	iface="$1"
+	wireguard_id=''
+	record_file="$(mktemp)"
+	config_file="$(mktemp)"
+	enabled='0'
+
+	if ! is_awg_active_iface "${iface}"; then
+		rm -f "${record_file}" "${config_file}"
+		return 0
+	fi
+	wireguard_id="$(read_assoc_wireguard_id "${iface}" || true)"
+	if [ -z "${wireguard_id}" ]; then
+		rm -f "${record_file}" "${config_file}"
+		return 0
+	fi
+	if ! fetch_db_record "${wireguard_id}" "${record_file}"; then
+		rm -f "${record_file}" "${config_file}"
+		return 0
+	fi
+	extract_db_config "${record_file}" "${config_file}"
+	enabled="$(db_meta_value "${record_file}" ENABLED || true)"
+	if db_config_has_awg_fields "${config_file}" && [ "${enabled}" = '1' ]; then
+		ensure_iface_policy_routing "${iface}" "${record_file}" "${config_file}"
+	fi
+	rm -f "${record_file}" "${config_file}"
+}
+
+repair_all_associated_policy_routing() {
+	if [ ! -d "${ASSOC_DIR}" ]; then
+		return 0
+	fi
+	find "${ASSOC_DIR}" -type f -name '*.meta' -print 2>/dev/null | while IFS= read -r assoc_path; do
+		iface_name="$(basename "${assoc_path}" .meta)"
+		repair_associated_iface_policy_routing "${iface_name}"
+	done
+}
+
+build_interfaces_output() {
+	active_managed_file="$1"
+	real_output="$("${REAL_WG}" show interfaces 2>/dev/null || true)"
+	awg_output="$("${AWG}" show interfaces 2>/dev/null || true)"
+	{
+		printf '%s\n' "${real_output}" | tr ' ' '\n' | awk '
+			NR == FNR {
+				managed[$1] = 1
+				next
+			}
+			NF && !($1 in managed) { print }
+		' "${active_managed_file}" -
+		printf '%s\n' "${awg_output}" | tr ' ' '\n' | awk '
+			NR == FNR {
+				managed[$1] = 1
+				next
+			}
+			NF && ($1 in managed) { print }
+		' "${active_managed_file}" -
+	} | awk '!seen[$0]++' | paste -sd' ' -
+}
+
+fetch_db_record() {
+	wireguard_id="$1"
+	output_file="$2"
+
+	require_exec "${MONGO_BIN}" mongo >/dev/null
+	"${MONGO_BIN}" --port "${MONGO_PORT}" --quiet "${MONGO_DB}" --eval "
+var doc = db.networkconf.findOne({
+  wireguard_id: ${wireguard_id},
+  purpose: 'vpn-client',
+  vpn_type: 'wireguard-client'
+});
+	if (!doc || !doc.wireguard_client_configuration_file) {
+	  quit(2);
+	}
+function emit(key, value) {
+  print(key + '=' + (value === undefined || value === null ? '' : value));
+}
+emit('ENABLED', doc.enabled ? '1' : '0');
+emit('IPV4', doc.ip_subnet || '');
+emit('IPV6', doc.ipv6_subnet || '');
+emit('MTU', doc.interface_mtu || '');
+print('CONFIG_BEGIN');
+print(doc.wireguard_client_configuration_file);
+print('CONFIG_END');
+	" >"${output_file}" 2>/dev/null
+}
+
+db_meta_value() {
+	record_file="$1"
+	key="$2"
+
+	awk -F= -v key="${key}" '
+		$1 == key {
+			sub(/^[^=]*=/, "", $0)
+			print $0
+			exit
+		}
+	' "${record_file}"
+}
+
+extract_db_config() {
+	record_file="$1"
+	output_file="$2"
+
+	awk '
+		/^CONFIG_BEGIN$/ {
+			in_config = 1
+			next
+		}
+		/^CONFIG_END$/ {
+			in_config = 0
+			exit
+		}
+		in_config { print }
+	' "${record_file}" >"${output_file}"
+}
+
+db_config_has_awg_fields() {
+	grep -Eq '^(Jc|Jmin|Jmax|S1|S2|S3|S4|H1|H2|H3|H4|I1|I2|I3|I4|I5)[[:space:]]*=' "$1"
+}
+
+build_awg_setconf() {
+	input_file="$1"
+	output_file="$2"
+
+	awk '
+		!/^(Address|DNS|MTU|Table|PreUp|PostUp|PreDown|PostDown|SaveConfig|ForcedHandshake)[[:space:]]*=/ {
+			print
+		}
+	' "${input_file}" >"${output_file}"
+}
+
+capture_iface_state() {
+	iface="$1"
+	state_dir="$2"
+
+	require_exec "${IP_BIN}" ip >/dev/null
+	mkdir -p "${state_dir}"
+	: >"${state_dir}/mtu"
+	printf '0\n' >"${state_dir}/is_up"
+	: >"${state_dir}/addr4"
+	: >"${state_dir}/addr6"
+	: >"${state_dir}/route4"
+	: >"${state_dir}/route6"
+
+	if ! iface_exists "${iface}"; then
+		return 1
+	fi
+
+	"${IP_BIN}" -o link show dev "${iface}" | awk '
+		{
+			for (i = 1; i <= NF; ++i) {
+				if ($i == "mtu") {
+					print $(i + 1)
+					exit
+				}
+			}
+		}
+	' >"${state_dir}/mtu"
+	if "${IP_BIN}" link show dev "${iface}" | grep -Eq '<[^>]*UP[^>]*>'; then
+		printf '1\n' >"${state_dir}/is_up"
+	fi
+	"${IP_BIN}" -o -4 addr show dev "${iface}" scope global | awk '{ print $4 }' >"${state_dir}/addr4" || true
+	"${IP_BIN}" -o -6 addr show dev "${iface}" scope global | awk '{ print $4 }' >"${state_dir}/addr6" || true
+	"${IP_BIN}" -o -4 route show table all dev "${iface}" >"${state_dir}/route4" || true
+	"${IP_BIN}" -o -6 route show table all dev "${iface}" >"${state_dir}/route6" || true
+	return 0
+}
+
+restore_iface_addresses() {
+	iface="$1"
+	family="$2"
+	address_file="$3"
+	batch_file="$(mktemp)"
+
+	while IFS= read -r address; do
+		[ -n "${address}" ] || continue
+		printf 'addr add %s dev %s\n' "${address}" "${iface}" >>"${batch_file}"
+	done <"${address_file}"
+	if [ -s "${batch_file}" ]; then
+		"${IP_BIN}" "-${family}" -batch "${batch_file}" >/dev/null 2>&1 || true
+	fi
+	rm -f "${batch_file}"
+}
+
+restore_iface_routes() {
+	family="$1"
+	route_file="$2"
+	batch_file="$(mktemp)"
+
+	while IFS= read -r route; do
+		[ -n "${route}" ] || continue
+		printf 'route replace %s\n' "${route}" >>"${batch_file}"
+	done <"${route_file}"
+	if [ -s "${batch_file}" ]; then
+		"${IP_BIN}" "-${family}" -batch "${batch_file}" >/dev/null 2>&1 || true
+	fi
+	rm -f "${batch_file}"
+}
+
+apply_iface_state() {
+	iface="$1"
+	record_file="$2"
+	state_dir="$3"
+	mtu=''
+	ipv4=''
+	ipv6=''
+
+	require_exec "${IP_BIN}" ip >/dev/null
+	mtu="$(db_meta_value "${record_file}" MTU || true)"
+	ipv4="$(db_meta_value "${record_file}" IPV4 || true)"
+	ipv6="$(db_meta_value "${record_file}" IPV6 || true)"
+
+	if [ -n "${mtu}" ]; then
+		"${IP_BIN}" link set mtu "${mtu}" dev "${iface}" >/dev/null 2>&1 || true
+	elif [ -s "${state_dir}/mtu" ]; then
+		"${IP_BIN}" link set mtu "$(cat "${state_dir}/mtu")" dev "${iface}" >/dev/null 2>&1 || true
+	fi
+	if [ -n "${ipv4}" ]; then
+		"${IP_BIN}" -4 addr add "${ipv4}" dev "${iface}" >/dev/null 2>&1 || true
+	else
+		restore_iface_addresses "${iface}" 4 "${state_dir}/addr4"
+	fi
+	if [ -n "${ipv6}" ]; then
+		"${IP_BIN}" -6 addr add "${ipv6}" dev "${iface}" >/dev/null 2>&1 || true
+	else
+		restore_iface_addresses "${iface}" 6 "${state_dir}/addr6"
+	fi
+	"${IP_BIN}" link set up dev "${iface}" >/dev/null 2>&1 || true
+	restore_iface_routes 4 "${state_dir}/route4"
+	restore_iface_routes 6 "${state_dir}/route6"
+}
+
+cleanup_iface_state() {
+	rm -rf "$1"
+}
+
+convert_iface_to_awg() {
+	iface="$1"
+	state_dir="$2"
+
+	require_exec "${IP_BIN}" ip >/dev/null
+	capture_iface_state "${iface}" "${state_dir}" || true
+	if iface_exists "${iface}"; then
+		"${IP_BIN}" link del dev "${iface}" >/dev/null 2>&1 || true
+	fi
+	"${IP_BIN}" link add "${iface}" type amneziawg
+}
+
+switch_iface_to_stock_and_apply_conf() {
+	command_name="$1"
+	iface="$2"
+	config_path="$3"
+
+	require_exec "${IP_BIN}" ip >/dev/null
+	if iface_exists "${iface}"; then
+		"${IP_BIN}" link del dev "${iface}" >/dev/null 2>&1 || true
+	fi
+	"${IP_BIN}" link add "${iface}" type wireguard >/dev/null 2>&1
+	"${REAL_WG}" "${command_name}" "${iface}" "${config_path}"
+	remove_assoc_file "${iface}"
+}
+
+cache_stock_config() {
+	iface="$1"
+	config_path="$2"
+
+	ensure_state_dirs
+	cp "${config_path}" "${CACHE_DIR}/${iface}.stock.conf"
+	chmod 600 "${CACHE_DIR}/${iface}.stock.conf"
+}
+
+handle_show_all_dump() {
+	real_tmp="$(mktemp)"
+	awg_tmp="$(mktemp)"
+	awg_norm_tmp="$(mktemp)"
+	active_managed_tmp="$(mktemp)"
+	status=0
+
+	repair_all_associated_policy_routing
+	if ! "${REAL_WG}" show all dump >"${real_tmp}" 2>/dev/null; then
+		status=1
+	fi
+	if ! "${AWG}" show all dump >"${awg_tmp}" 2>/dev/null; then
+		: >"${awg_norm_tmp}"
+	else
+		normalize_awg_dump_file "${awg_tmp}" "${awg_norm_tmp}"
+	fi
+	build_active_managed_file "${active_managed_tmp}"
+
+	filter_dump_excluding_file "${active_managed_tmp}" <"${real_tmp}"
+	filter_dump_only_file "${active_managed_tmp}" <"${awg_norm_tmp}"
+
+	rm -f "${real_tmp}" "${awg_tmp}" "${awg_norm_tmp}" "${active_managed_tmp}"
+	return "${status}"
+}
+
+handle_show_interfaces() {
+	active_managed_tmp="$(mktemp)"
+	build_active_managed_file "${active_managed_tmp}"
+	build_interfaces_output "${active_managed_tmp}"
+	rm -f "${active_managed_tmp}"
+}
+
+handle_showconf() {
+	iface="$1"
+	cached_config="${CACHE_DIR}/${iface}.stock.conf"
+
+	if ! is_associated_iface "${iface}" || ! is_awg_active_iface "${iface}"; then
+		exec "${REAL_WG}" showconf "${iface}"
+	fi
+	if [ -f "${cached_config}" ]; then
+		cat "${cached_config}"
+		return 0
+	fi
+	exec "${AWG}" showconf "${iface}"
+}
+
+handle_apply_conf() {
+	command_name="$1"
+	iface="$2"
+	config_path="$3"
+	wireguard_id=''
+	record_file="$(mktemp)"
+	db_config_file="$(mktemp)"
+	awg_config_file="$(mktemp)"
+	state_dir="$(mktemp -d)"
+	was_associated=0
+	enabled='0'
+
+	if is_associated_iface "${iface}"; then
+		was_associated=1
+		wireguard_id="$(read_assoc_wireguard_id "${iface}" || true)"
+	else
+		wireguard_id="$(extract_wireguard_id "${iface}" || true)"
+	fi
+	if [ -z "${wireguard_id}" ]; then
+		log_reason "${command_name} ${iface}: no wireguard_id extracted, proxying real wg"
+		rm -f "${record_file}" "${db_config_file}" "${awg_config_file}"
+		cleanup_iface_state "${state_dir}"
+		exec "${REAL_WG}" "${command_name}" "${iface}" "${config_path}"
+	fi
+	if ! fetch_db_record "${wireguard_id}" "${record_file}"; then
+		log_reason "${command_name} ${iface}: mongo lookup failed for wireguard_id=${wireguard_id}, proxying real wg"
+		if [ "${was_associated}" = '1' ]; then
+			switch_iface_to_stock_and_apply_conf "${command_name}" "${iface}" "${config_path}"
+			rm -f "${record_file}" "${db_config_file}" "${awg_config_file}"
+			cleanup_iface_state "${state_dir}"
+			return 0
+		fi
+		rm -f "${record_file}" "${db_config_file}" "${awg_config_file}"
+		cleanup_iface_state "${state_dir}"
+		exec "${REAL_WG}" "${command_name}" "${iface}" "${config_path}"
+	fi
+
+	extract_db_config "${record_file}" "${db_config_file}"
+	enabled="$(db_meta_value "${record_file}" ENABLED || true)"
+	if ! db_config_has_awg_fields "${db_config_file}" || [ "${enabled}" != '1' ]; then
+		log_reason "${command_name} ${iface}: db record wireguard_id=${wireguard_id} is not enabled AWG, proxying real wg"
+		if [ "${was_associated}" = '1' ]; then
+			switch_iface_to_stock_and_apply_conf "${command_name}" "${iface}" "${config_path}"
+			rm -f "${record_file}" "${db_config_file}" "${awg_config_file}"
+			cleanup_iface_state "${state_dir}"
+			return 0
+		fi
+		rm -f "${record_file}" "${db_config_file}" "${awg_config_file}"
+		cleanup_iface_state "${state_dir}"
+		exec "${REAL_WG}" "${command_name}" "${iface}" "${config_path}"
+	fi
+
+	build_awg_setconf "${db_config_file}" "${awg_config_file}"
+	cache_stock_config "${iface}" "${config_path}"
+	write_assoc_file "${iface}" "${wireguard_id}"
+	log_reason "${command_name} ${iface}: converting wireguard_id=${wireguard_id} to amneziawg"
+
+	if ! is_awg_active_iface "${iface}"; then
+		if ! convert_iface_to_awg "${iface}" "${state_dir}"; then
+			log_reason "${command_name} ${iface}: failed to create amneziawg iface"
+			remove_assoc_file "${iface}"
+			rm -f "${record_file}" "${db_config_file}" "${awg_config_file}"
+			cleanup_iface_state "${state_dir}"
+			return 1
+		fi
+	fi
+
+	if "${AWG}" setconf "${iface}" "${awg_config_file}"; then
+		log_reason "${command_name} ${iface}: awg setconf applied successfully"
+		apply_iface_state "${iface}" "${record_file}" "${state_dir}"
+		ensure_iface_policy_routing "${iface}" "${record_file}" "${db_config_file}"
+		rm -f "${record_file}" "${db_config_file}" "${awg_config_file}"
+		cleanup_iface_state "${state_dir}"
+		return 0
+	fi
+
+	log_reason "${command_name} ${iface}: awg setconf failed, rolling back to stock wg"
+	switch_iface_to_stock_and_apply_conf "${command_name}" "${iface}" "${config_path}" || true
+	remove_assoc_file "${iface}"
+	rm -f "${record_file}" "${db_config_file}" "${awg_config_file}"
+	cleanup_iface_state "${state_dir}"
+	return 1
+}
+
+proxy_real_wg() {
+	exec "${REAL_WG}" "$@"
+}
+
+require_exec "${REAL_WG}" wg
+require_exec "${AWG}" awg
+
+log_message "$@"
+
+if [ $# -eq 0 ] || ! has_associated_ifaces; then
+	case "${1:-}" in
+		setconf|syncconf)
+			if [ $# -ge 3 ]; then
+				handle_apply_conf "$1" "$2" "$3"
+				exit $?
+			fi
+			proxy_real_wg "$@"
+			;;
+		*)
+			proxy_real_wg "$@"
+			;;
+	esac
+fi
+
+command="$1"
+
+case "${command}" in
+	show)
+		if [ $# -ge 3 ] && [ "$2" = "all" ] && [ "$3" = "dump" ]; then
+			handle_show_all_dump
+			exit $?
+		fi
+		if [ $# -eq 2 ] && [ "$2" = "interfaces" ]; then
+			handle_show_interfaces
+			exit 0
+		fi
+		if [ $# -ge 2 ] && is_associated_iface "$2" && is_awg_active_iface "$2"; then
+			exec "${AWG}" "$@"
+		fi
+		proxy_real_wg "$@"
+		;;
+	showconf)
+		if [ $# -ge 2 ]; then
+			handle_showconf "$2"
+			exit $?
+		fi
+		proxy_real_wg "$@"
+		;;
+	setconf|syncconf)
+		if [ $# -ge 3 ]; then
+			handle_apply_conf "$1" "$2" "$3"
+			exit $?
+		fi
+		proxy_real_wg "$@"
+		;;
+	set)
+		if [ $# -ge 2 ] && is_associated_iface "$2" && is_awg_active_iface "$2"; then
+			exec "${AWG}" "$@"
+		fi
+		proxy_real_wg "$@"
+		;;
+	*)
+		proxy_real_wg "$@"
+		;;
+esac

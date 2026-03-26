@@ -1,0 +1,79 @@
+diff --git a/src/socket.c b/src/socket.c
+index 5d1e9e6..75dd1c4 100644
+--- a/src/socket.c
++++ b/src/socket.c
+@@ -393,16 +393,19 @@ retry:
+ 	if (ipv6_mod_enabled()) {
+ 		port6.local_udp_port = inet_sk(new4->sk)->inet_sport;
+ 		ret = udp_sock_create(net, &port6, &new6);
+ 		if (ret < 0) {
+-			udp_tunnel_sock_release(new4);
+-			if (ret == -EADDRINUSE && !port && retries++ < 100)
+-				goto retry;
+-			pr_err("%s: Could not create IPv6 socket\n",
+-			       wg->dev->name);
+-			goto out;
++			if (ret == -EADDRINUSE && !port && retries++ < 100) {
++				udp_tunnel_sock_release(new4);
++				goto retry;
++			}
++			pr_warn("%s: Could not create IPv6 socket, continuing with IPv4 only (%d)\n",
++				wg->dev->name, ret);
++			new6 = NULL;
++		} else {
++			set_sock_opts(new6);
++			setup_udp_tunnel_sock(net, new6, &cfg);
+ 		}
+-		set_sock_opts(new6);
+-		setup_udp_tunnel_sock(net, new6, &cfg);
+ 	}
+ #endif
+ 
+ 	wg_socket_reinit(wg, new4->sk, new6 ? new6->sk : NULL);
+diff --git a/src/netlink.c b/src/netlink.c
+index 8a4a985..48e78d7 100644
+--- a/src/netlink.c
++++ b/src/netlink.c
+@@ -418,7 +418,6 @@ static int wg_get_device_dump(struct sk_buff *skb, struct netlink_callback *cb)
+ 	int ret = -EMSGSIZE;
+ 	bool done = true;
+ 	void *hdr;
+-	char buf[32];
+ 
+ 	rtnl_lock();
+ 	mutex_lock(&wg->device_update_lock);
+@@ -432,28 +431,7 @@ static int wg_get_device_dump(struct sk_buff *skb, struct netlink_callback *cb)
+ 		if (nla_put_u16(skb, WGDEVICE_A_LISTEN_PORT,
+ 				wg->incoming_port) ||
+ 		    nla_put_u32(skb, WGDEVICE_A_FWMARK, wg->fwmark) ||
+ 		    nla_put_u32(skb, WGDEVICE_A_IFINDEX, wg->dev->ifindex) ||
+-		    nla_put_string(skb, WGDEVICE_A_IFNAME, wg->dev->name) ||
+-		    nla_put_u16(skb, WGDEVICE_A_JC, wg->jc) ||
+-		    nla_put_u16(skb, WGDEVICE_A_JMIN, wg->jmin) ||
+-		    nla_put_u16(skb, WGDEVICE_A_JMAX, wg->jmax) ||
+-		    nla_put_u16(skb, WGDEVICE_A_S1, wg->junk_size[MSGIDX_HANDSHAKE_INIT]) ||
+-		    nla_put_u16(skb, WGDEVICE_A_S2,wg->junk_size[MSGIDX_HANDSHAKE_RESPONSE]) ||
+-		    (mh_genspec(&wg->headers[MSGIDX_HANDSHAKE_INIT], buf, sizeof(buf)) &&
+-				nla_put_string(skb, WGDEVICE_A_H1, buf)) ||
+-			(mh_genspec(&wg->headers[MSGIDX_HANDSHAKE_RESPONSE], buf, sizeof(buf)) &&
+-				nla_put_string(skb, WGDEVICE_A_H2, buf)) ||
+-			(mh_genspec(&wg->headers[MSGIDX_HANDSHAKE_COOKIE], buf, sizeof(buf)) &&
+-				nla_put_string(skb, WGDEVICE_A_H3, buf)) ||
+-			(mh_genspec(&wg->headers[MSGIDX_TRANSPORT], buf, sizeof(buf)) &&
+-				nla_put_string(skb, WGDEVICE_A_H4, buf)) ||
+-			nla_put_u16(skb, WGDEVICE_A_S3, wg->junk_size[MSGIDX_HANDSHAKE_COOKIE]) ||
+-			nla_put_u16(skb, WGDEVICE_A_S4, wg->junk_size[MSGIDX_TRANSPORT]) ||
+-			(wg->ispecs[0].desc &&
+-				nla_put_string(skb, WGDEVICE_A_I1, wg->ispecs[0].desc)) ||
+-			(wg->ispecs[1].desc &&
+-				nla_put_string(skb, WGDEVICE_A_I2, wg->ispecs[1].desc)) ||
+-			(wg->ispecs[2].desc &&
+-				nla_put_string(skb, WGDEVICE_A_I3, wg->ispecs[2].desc)) ||
+-			(wg->ispecs[3].desc &&
+-				nla_put_string(skb, WGDEVICE_A_I4, wg->ispecs[3].desc)) ||
+-			(wg->ispecs[4].desc &&
+-				nla_put_string(skb, WGDEVICE_A_I5, wg->ispecs[4].desc)))
++		    nla_put_string(skb, WGDEVICE_A_IFNAME, wg->dev->name))
+ 			goto out;
+ 
+ 		down_read(&wg->static_identity.lock);
