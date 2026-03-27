@@ -58,8 +58,8 @@ capture_iface_state() {
 	fi
 	"${IP_BIN}" -o -4 addr show dev "${IFACE}" scope global | awk '{ print $4 }' >"${state_dir}/addr4" || true
 	"${IP_BIN}" -o -6 addr show dev "${IFACE}" scope global | awk '{ print $4 }' >"${state_dir}/addr6" || true
-	"${IP_BIN}" -o -4 route show dev "${IFACE}" >"${state_dir}/route4" || true
-	"${IP_BIN}" -o -6 route show dev "${IFACE}" >"${state_dir}/route6" || true
+	"${IP_BIN}" -o -4 route show table all dev "${IFACE}" >"${state_dir}/route4" || true
+	"${IP_BIN}" -o -6 route show table all dev "${IFACE}" >"${state_dir}/route6" || true
 	return 0
 }
 
