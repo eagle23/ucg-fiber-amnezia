@@ -141,6 +141,8 @@ scp \
   output/amneziawg.ko \
   output/awg \
   output/awg-quick \
+  scripts/wg-shim \
+  scripts/install-wg-shim.sh \
   scripts/amneziawg.rc.local \
   root@192.168.1.1:/data/amneziawg/
 ```
@@ -174,6 +176,13 @@ journalctl -b -u rc-local.service --no-pager | tail -n 100
 ```
 
 выведет пусто. В этом случае `rc.local` просто грузит модуль и создаёт `/data/amneziawg/tunnels/`.
+
+Если рядом лежат:
+
+- `/data/amneziawg/wg-shim`
+- `/data/amneziawg/install-wg-shim.sh`
+
+то этот же `rc.local` на каждом boot автоматически заново ставит bind mount на системный `wg`, так что UI-коннекты Amnezia продолжают перехватываться после reboot.
 
 ## Отладка на роутере
 
