@@ -17,16 +17,18 @@ REAL_WG="${WG_SHIM_REAL:-/data/wg-shim/orig/wg}"
 AWG="${WG_SHIM_AWG:-/data/amneziawg/awg}"
 IP_BIN="${WG_SHIM_IP:-$(find_binary ip /usr/sbin/ip /usr/bin/ip /sbin/ip /bin/ip)}"
 MONGO_BIN="${WG_SHIM_MONGO:-$(find_binary mongo /usr/bin/mongo /bin/mongo /data/mongo/bin/mongo)}"
+FLOCK_BIN="${WG_SHIM_FLOCK:-$(find_binary flock /usr/bin/flock /bin/flock /usr/sbin/flock /sbin/flock)}"
 MONGO_PORT="${WG_SHIM_MONGO_PORT:-27117}"
 MONGO_DB="${WG_SHIM_MONGO_DB:-ace}"
 STATE_DIR="${WG_SHIM_STATE_DIR:-/data/wg-shim}"
 CACHE_DIR="${WG_SHIM_CACHE_DIR:-${STATE_DIR}/cache}"
 ASSOC_DIR="${WG_SHIM_ASSOC_DIR:-${STATE_DIR}/iface-extra.d}"
+LOCK_DIR="${WG_SHIM_LOCK_DIR:-${STATE_DIR}/locks}"
 LOG_FILE="${WG_SHIM_LOG_FILE:-${STATE_DIR}/wg-shim.log}"
 LOG_ENABLED="${WG_SHIM_LOG_ENABLED:-1}"
 
 ensure_state_dirs() {
-	mkdir -p "${STATE_DIR}" "${CACHE_DIR}" "${ASSOC_DIR}"
+	mkdir -p "${STATE_DIR}" "${CACHE_DIR}" "${ASSOC_DIR}" "${LOCK_DIR}"
 }
 
 require_exec() {
@@ -103,17 +105,66 @@ has_associated_ifaces() {
 	[ -d "${ASSOC_DIR}" ] && find "${ASSOC_DIR}" -type f -name '*.meta' -print -quit 2>/dev/null | grep -q .
 }
 
+is_valid_wireguard_id() {
+	case "${1:-}" in
+		''|*[!0-9]*)
+			return 1
+			;;
+		*)
+			return 0
+			;;
+	esac
+}
+
 extract_wireguard_id() {
 	iface="$1"
 	case "${iface}" in
 		wgclt[0-9]*)
-			printf '%s\n' "${iface#wgclt}"
+			wireguard_id="${iface#wgclt}"
+			is_valid_wireguard_id "${wireguard_id}" || return 1
+			printf '%s\n' "${wireguard_id}"
 			return 0
 			;;
 		*)
 			return 1
 			;;
 	esac
+}
+
+run_with_iface_lock() {
+	iface="$1"
+	shift
+	lock_file="${LOCK_DIR}/${iface}.lock"
+
+	ensure_state_dirs
+	if [ -n "${FLOCK_BIN}" ] && [ -x "${FLOCK_BIN}" ]; then
+		(
+			"${FLOCK_BIN}" -x 200
+			"$@"
+		) 200>"${lock_file}"
+		return $?
+	fi
+
+	lock_dir="${lock_file}.d"
+	attempts=0
+	while ! mkdir "${lock_dir}" 2>/dev/null; do
+		attempts=$((attempts + 1))
+		if [ "${attempts}" -ge 30 ]; then
+			log_reason "lock timeout for ${iface}, clearing stale lock ${lock_dir}"
+			rmdir "${lock_dir}" 2>/dev/null || rm -rf "${lock_dir}" 2>/dev/null || true
+			attempts=0
+		fi
+		sleep 1
+	done
+	trap 'rmdir "${lock_dir}" 2>/dev/null || rm -rf "${lock_dir}" 2>/dev/null || true' EXIT HUP INT TERM
+	if "$@"; then
+		status=0
+	else
+		status=$?
+	fi
+	trap - EXIT HUP INT TERM
+	rmdir "${lock_dir}" 2>/dev/null || rm -rf "${lock_dir}" 2>/dev/null || true
+	return "${status}"
 }
 
 is_awg_active_iface() {
@@ -319,7 +370,7 @@ ensure_iface_policy_routing() {
 	fi
 }
 
-repair_associated_iface_policy_routing() {
+repair_associated_iface_policy_routing_locked() {
 	iface="$1"
 	wireguard_id=''
 	record_file="$(mktemp)"
@@ -345,6 +396,11 @@ repair_associated_iface_policy_routing() {
 		ensure_iface_policy_routing "${iface}" "${record_file}" "${config_file}"
 	fi
 	rm -f "${record_file}" "${config_file}"
+}
+
+repair_associated_iface_policy_routing() {
+	iface="$1"
+	run_with_iface_lock "${iface}" repair_associated_iface_policy_routing_locked "${iface}"
 }
 
 repair_all_associated_policy_routing() {
@@ -383,6 +439,7 @@ fetch_db_record() {
 	wireguard_id="$1"
 	output_file="$2"
 
+	is_valid_wireguard_id "${wireguard_id}" || return 1
 	require_exec "${MONGO_BIN}" mongo >/dev/null
 	"${MONGO_BIN}" --port "${MONGO_PORT}" --quiet "${MONGO_DB}" --eval "
 var doc = db.networkconf.findOne({
@@ -637,7 +694,7 @@ handle_showconf() {
 	exec "${AWG}" showconf "${iface}"
 }
 
-handle_apply_conf() {
+handle_apply_conf_locked() {
 	command_name="$1"
 	iface="$2"
 	config_path="$3"
@@ -659,7 +716,8 @@ handle_apply_conf() {
 		log_reason "${command_name} ${iface}: no wireguard_id extracted, proxying real wg"
 		rm -f "${record_file}" "${db_config_file}" "${awg_config_file}"
 		cleanup_iface_state "${state_dir}"
-		exec "${REAL_WG}" "${command_name}" "${iface}" "${config_path}"
+		"${REAL_WG}" "${command_name}" "${iface}" "${config_path}"
+		return $?
 	fi
 	if ! fetch_db_record "${wireguard_id}" "${record_file}"; then
 		log_reason "${command_name} ${iface}: mongo lookup failed for wireguard_id=${wireguard_id}, proxying real wg"
@@ -671,7 +729,8 @@ handle_apply_conf() {
 		fi
 		rm -f "${record_file}" "${db_config_file}" "${awg_config_file}"
 		cleanup_iface_state "${state_dir}"
-		exec "${REAL_WG}" "${command_name}" "${iface}" "${config_path}"
+		"${REAL_WG}" "${command_name}" "${iface}" "${config_path}"
+		return $?
 	fi
 
 	extract_db_config "${record_file}" "${db_config_file}"
@@ -686,7 +745,8 @@ handle_apply_conf() {
 		fi
 		rm -f "${record_file}" "${db_config_file}" "${awg_config_file}"
 		cleanup_iface_state "${state_dir}"
-		exec "${REAL_WG}" "${command_name}" "${iface}" "${config_path}"
+		"${REAL_WG}" "${command_name}" "${iface}" "${config_path}"
+		return $?
 	fi
 
 	build_awg_setconf "${db_config_file}" "${awg_config_file}"
@@ -721,6 +781,14 @@ handle_apply_conf() {
 	return 1
 }
 
+handle_apply_conf() {
+	command_name="$1"
+	iface="$2"
+	config_path="$3"
+
+	run_with_iface_lock "${iface}" handle_apply_conf_locked "${command_name}" "${iface}" "${config_path}"
+}
+
 proxy_real_wg() {
 	exec "${REAL_WG}" "$@"
 }
@@ -730,7 +798,11 @@ require_exec "${AWG}" awg
 
 log_message "$@"
 
-if [ $# -eq 0 ] || ! has_associated_ifaces; then
+if [ $# -eq 0 ]; then
+	proxy_real_wg "$@"
+fi
+
+if ! has_associated_ifaces; then
 	case "${1:-}" in
 		setconf|syncconf)
 			if [ $# -ge 3 ]; then

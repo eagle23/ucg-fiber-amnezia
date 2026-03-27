@@ -21,7 +21,8 @@ fi
 mkdir -p \
 	"${ORIG_DIR}" \
 	"${STATE_DIR}/iface-extra.d" \
-	"${STATE_DIR}/cache"
+	"${STATE_DIR}/cache" \
+	"${STATE_DIR}/locks"
 touch "${LOG_FILE}"
 chmod 600 "${LOG_FILE}"
 

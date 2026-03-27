@@ -119,13 +119,61 @@ wg syncconf wgcltN /run/wireguard_*.config
 - `scripts/install-wg-shim.sh`
 - `scripts/uninstall-wg-shim.sh`
 - `scripts/restore-managed-iface.sh`
-- `scripts/amneziawg.service`
+
+Опционально:
+
+- `scripts/amneziawg.rc.local` — если хочешь автозагрузку через штатный `rc-local.service`
 
 Готовые артефакты:
 
 - `output/amneziawg.ko`
 - `output/awg`
 - `output/awg-quick`
+
+## Автозагрузка через rc.local
+
+Если после reboot модуль не поднимается, на `UCG Fiber` проще не завязываться на отдельный `systemd` unit, а использовать штатный `rc-local.service`.
+
+Скопировать:
+
+```bash
+scp \
+  output/amneziawg.ko \
+  output/awg \
+  output/awg-quick \
+  scripts/amneziawg.rc.local \
+  root@192.168.1.1:/data/amneziawg/
+```
+
+Потом на роутере:
+
+```bash
+chmod +x /data/amneziawg/awg /data/amneziawg/awg-quick
+uname -r > /data/amneziawg/.kernel-version
+mkdir -p /data/amneziawg/tunnels
+
+cp /data/amneziawg/amneziawg.rc.local /etc/rc.local
+chmod +x /etc/rc.local
+
+systemctl daemon-reload
+systemctl start rc-local.service
+```
+
+Проверка:
+
+```bash
+systemctl status rc-local.service --no-pager
+lsmod | grep amneziawg
+journalctl -b -u rc-local.service --no-pager | tail -n 100
+```
+
+Если тоннелей ещё нет, это нормально:
+
+```bash
+/data/amneziawg/awg show
+```
+
+выведет пусто. В этом случае `rc.local` просто грузит модуль и создаёт `/data/amneziawg/tunnels/`.
 
 ## Отладка на роутере
 

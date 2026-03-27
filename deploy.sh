@@ -4,6 +4,7 @@ set -euo pipefail
 ROUTER="${1:-root@192.168.1.1}"
 REMOTE_DIR="/data/amneziawg"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+INSTALL_SERVICE="${INSTALL_SERVICE:-0}"
 
 echo "=== Deploying AmneziaWG to ${ROUTER} ==="
 
@@ -20,16 +21,21 @@ ssh "${ROUTER}" "mkdir -p ${REMOTE_DIR}"
 
 # Copy artifacts
 echo "Copying artifacts..."
-scp "${SCRIPT_DIR}/output/amneziawg.ko" "${ROUTER}:${REMOTE_DIR}/"
-scp "${SCRIPT_DIR}/output/awg"          "${ROUTER}:${REMOTE_DIR}/"
-scp "${SCRIPT_DIR}/output/awg-quick"    "${ROUTER}:${REMOTE_DIR}/"
-scp "${SCRIPT_DIR}/scripts/amneziawg.service" "${ROUTER}:${REMOTE_DIR}/"
+scp -p \
+    "${SCRIPT_DIR}/output/amneziawg.ko" \
+    "${SCRIPT_DIR}/output/awg" \
+    "${SCRIPT_DIR}/output/awg-quick" \
+    "${ROUTER}:${REMOTE_DIR}/"
 
-# Set permissions
-ssh "${ROUTER}" "chmod +x ${REMOTE_DIR}/awg ${REMOTE_DIR}/awg-quick"
+if [ "${INSTALL_SERVICE}" = "1" ]; then
+    scp -p "${SCRIPT_DIR}/scripts/amneziawg.service" "${ROUTER}:${REMOTE_DIR}/"
+fi
 
-# Save current kernel version for firmware update detection
-ssh "${ROUTER}" "uname -r > ${REMOTE_DIR}/.kernel-version"
+# Set permissions and save current kernel version for firmware update detection
+ssh "${ROUTER}" "chmod +x ${REMOTE_DIR}/awg ${REMOTE_DIR}/awg-quick && uname -r > ${REMOTE_DIR}/.kernel-version"
+
+# Create tunnel directory for optional service-managed startup
+ssh "${ROUTER}" "mkdir -p ${REMOTE_DIR}/tunnels"
 
 # Unload old module if loaded
 ssh "${ROUTER}" "rmmod amneziawg 2>/dev/null || true"
@@ -46,15 +52,16 @@ echo "Verifying..."
 ssh "${ROUTER}" "lsmod | grep amneziawg"
 ssh "${ROUTER}" "dmesg | tail -3"
 
-# Install systemd service for boot persistence
-echo "Installing systemd service..."
-ssh "${ROUTER}" "cp ${REMOTE_DIR}/amneziawg.service /etc/systemd/system/amneziawg.service"
-ssh "${ROUTER}" "systemctl daemon-reload"
-ssh "${ROUTER}" "systemctl enable amneziawg.service"
+if [ "${INSTALL_SERVICE}" = "1" ]; then
+    echo "Installing systemd service..."
+    ssh "${ROUTER}" "cp ${REMOTE_DIR}/amneziawg.service /etc/systemd/system/amneziawg.service"
+    ssh "${ROUTER}" "systemctl daemon-reload"
+    ssh "${ROUTER}" "systemctl enable amneziawg.service"
+fi
 
 echo ""
 echo "=== Deployment complete ==="
-echo "Module loaded. To configure a tunnel:"
+echo "Module loaded. To configure a tunnel manually:"
 echo "  ssh ${ROUTER}"
 echo "  cat > ${REMOTE_DIR}/awg0.conf << EOF"
 echo "  [Interface]"
@@ -75,3 +82,6 @@ echo "  Endpoint = <server>:51820"
 echo "  AllowedIPs = 0.0.0.0/0"
 echo "  EOF"
 echo "  AWG=${REMOTE_DIR}/awg bash ${REMOTE_DIR}/awg-quick up ${REMOTE_DIR}/awg0.conf"
+echo ""
+echo "Optional: install boot service with INSTALL_SERVICE=1 ./deploy.sh ${ROUTER}"
+echo "If you use the service, put tunnel configs into ${REMOTE_DIR}/tunnels/"
