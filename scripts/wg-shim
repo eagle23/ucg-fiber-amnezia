@@ -138,10 +138,7 @@ run_with_iface_lock() {
 
 	ensure_state_dirs
 	if [ -n "${FLOCK_BIN}" ] && [ -x "${FLOCK_BIN}" ]; then
-		(
-			"${FLOCK_BIN}" -x 200
-			"$@"
-		) 200>"${lock_file}"
+		"${FLOCK_BIN}" -x "${lock_file}" "$0" __wg_shim_locked "$@"
 		return $?
 	fi
 
@@ -795,6 +792,26 @@ proxy_real_wg() {
 
 require_exec "${REAL_WG}" wg
 require_exec "${AWG}" awg
+
+if [ "${1:-}" = "__wg_shim_locked" ]; then
+	shift
+	locked_command="${1:-}"
+	shift || true
+	case "${locked_command}" in
+		handle_apply_conf_locked)
+			handle_apply_conf_locked "$@"
+			exit $?
+			;;
+		repair_associated_iface_policy_routing_locked)
+			repair_associated_iface_policy_routing_locked "$@"
+			exit $?
+			;;
+		*)
+			echo "wg-shim: unknown locked command: ${locked_command}" >&2
+			exit 2
+			;;
+	esac
+fi
 
 log_message "$@"
 
