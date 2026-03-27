@@ -1,0 +1,51 @@
+#!/bin/sh
+set -eu
+
+BASE=/data/amneziawg
+TUNNELS_DIR="${BASE}/tunnels"
+MODULE="${BASE}/amneziawg.ko"
+AWG_BIN="${BASE}/awg"
+AWG_QUICK="${BASE}/awg-quick"
+KERNEL_FILE="${BASE}/.kernel-version"
+
+log_message() {
+    logger -t amneziawg-rc "$*"
+}
+
+[ -f "${MODULE}" ] || exit 0
+[ -f "${AWG_BIN}" ] || exit 0
+[ -f "${AWG_QUICK}" ] || exit 0
+
+mkdir -p "${TUNNELS_DIR}"
+chmod 0755 "${AWG_BIN}" "${AWG_QUICK}"
+
+CURRENT_KERNEL="$(uname -r)"
+EXPECTED_KERNEL="$(cat "${KERNEL_FILE}" 2>/dev/null || true)"
+
+if [ -n "${EXPECTED_KERNEL}" ] && [ "${EXPECTED_KERNEL}" != "${CURRENT_KERNEL}" ]; then
+    log_message "kernel mismatch: expected=${EXPECTED_KERNEL} current=${CURRENT_KERNEL}; refusing to load module"
+    exit 0
+fi
+
+modprobe udp_tunnel 2>/dev/null || true
+modprobe ip6_udp_tunnel 2>/dev/null || true
+
+if ! lsmod | grep -q '^amneziawg '; then
+    if insmod "${MODULE}"; then
+        log_message "amneziawg module loaded"
+    else
+        log_message "failed to load amneziawg module"
+        exit 0
+    fi
+fi
+
+for conf in "${TUNNELS_DIR}"/*.conf; do
+    [ -f "${conf}" ] || continue
+    if AWG="${AWG_BIN}" bash "${AWG_QUICK}" up "${conf}"; then
+        log_message "tunnel up: ${conf}"
+    else
+        log_message "failed to bring tunnel up: ${conf}"
+    fi
+done
+
+exit 0
