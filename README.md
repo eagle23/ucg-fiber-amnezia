@@ -119,7 +119,10 @@ wg syncconf wgcltN /run/wireguard_*.config
 - `scripts/install-wg-shim.sh`
 - `scripts/uninstall-wg-shim.sh`
 - `scripts/restore-managed-iface.sh`
-- `scripts/amneziawg.service`
+
+Опционально:
+
+- `scripts/amneziawg.service` — если хочешь автозагрузку через `systemd`
 
 Готовые артефакты:
 
