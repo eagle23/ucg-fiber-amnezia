@@ -5,11 +5,32 @@ KERNEL_VERSION="5.4.213"
 EXTRAVERSION="-ui-ipq9574"
 KERNEL_DIR="/build/linux-${KERNEL_VERSION}"
 OUTPUT_DIR="/build/output"
+AMNEZIAWG_MODULE_REPO="https://github.com/amnezia-vpn/amneziawg-linux-kernel-module.git"
+AMNEZIAWG_MODULE_REF="${AMNEZIAWG_MODULE_REF:-v1.0.20260322}"
+AMNEZIAWG_TOOLS_REPO="https://github.com/amnezia-vpn/amneziawg-tools.git"
+AMNEZIAWG_TOOLS_REF="${AMNEZIAWG_TOOLS_REF:-v1.0.20260223}"
 
 ARCH="arm64"
 CROSS_COMPILE="aarch64-linux-gnu-"
 
 mkdir -p "${OUTPUT_DIR}"
+
+checkout_repo_ref() {
+    local repo_dir="$1"
+    local repo_url="$2"
+    local repo_ref="$3"
+
+    if [ -e "${repo_dir}" ] && [ ! -d "${repo_dir}/.git" ]; then
+        rm -rf "${repo_dir}"
+    fi
+    if [ ! -d "${repo_dir}/.git" ]; then
+        git clone "${repo_url}" "${repo_dir}"
+    fi
+    git -C "${repo_dir}" fetch --tags --force origin
+    git -C "${repo_dir}" checkout --force "${repo_ref}"
+    git -C "${repo_dir}" reset --hard "${repo_ref}"
+    git -C "${repo_dir}" clean -fdx
+}
 
 patch_vendor_netdevice_layout() {
     local netdevice_h="$1"
@@ -228,9 +249,7 @@ fi
 echo "=== Building amneziawg.ko ==="
 
 cd /build
-if [ ! -d amneziawg-linux-kernel-module ]; then
-    git clone --depth 1 https://github.com/amnezia-vpn/amneziawg-linux-kernel-module.git
-fi
+checkout_repo_ref /build/amneziawg-linux-kernel-module "${AMNEZIAWG_MODULE_REPO}" "${AMNEZIAWG_MODULE_REF}"
 
 cd /build/amneziawg-linux-kernel-module
 
@@ -302,9 +321,7 @@ echo "Built: ${OUTPUT_DIR}/amneziawg.ko"
 echo "=== Building awg userspace tool ==="
 
 cd /build
-if [ ! -d amneziawg-tools ]; then
-    git clone --depth 1 https://github.com/amnezia-vpn/amneziawg-tools.git
-fi
+checkout_repo_ref /build/amneziawg-tools "${AMNEZIAWG_TOOLS_REPO}" "${AMNEZIAWG_TOOLS_REF}"
 
 cd amneziawg-tools/src
 make CC="${CROSS_COMPILE}gcc" -j"$(nproc)"

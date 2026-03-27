@@ -6,6 +6,7 @@ Before=network.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+TimeoutStopSec=30
 
 # Check kernel version matches built module
 ExecStartPre=/bin/bash -c '\
@@ -19,20 +20,21 @@ ExecStartPre=/bin/bash -c '\
 # Load dependencies
 ExecStartPre=/sbin/modprobe udp_tunnel
 ExecStartPre=/sbin/modprobe ip6_udp_tunnel
+ExecStartPre=/bin/mkdir -p /data/amneziawg/tunnels
 
 # Load AmneziaWG module
 ExecStart=/sbin/insmod /data/amneziawg/amneziawg.ko
 
 # Bring up configured interfaces
 ExecStartPost=/bin/bash -c '\
-    for conf in /data/amneziawg/*.conf; do \
+    for conf in /data/amneziawg/tunnels/*.conf; do \
         [ -f "$conf" ] || continue; \
         AWG=/data/amneziawg/awg bash /data/amneziawg/awg-quick up "$conf" || true; \
     done'
 
 # Tear down interfaces on stop
 ExecStop=/bin/bash -c '\
-    for conf in /data/amneziawg/*.conf; do \
+    for conf in /data/amneziawg/tunnels/*.conf; do \
         [ -f "$conf" ] || continue; \
         AWG=/data/amneziawg/awg bash /data/amneziawg/awg-quick down "$conf" || true; \
     done'
