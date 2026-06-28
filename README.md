@@ -34,7 +34,11 @@ server responds, and the UI shows Established.
 1. **Kernel** — `amneziawg` rebuilt as `wireguard` (`build.sh`,
    `kmod/iface_junk.{c,h}`): renamed rtnl-link/genl family; `iface_junk` module
    param (`<ifname>\t<key>=<value>\t...`) applied in `wg_newlink` and re-applied
-   when the param is rewritten.
+   when the param is rewritten. Because it builds against **stock** kernel.org
+   5.4.213 headers but runs on the UCG vendor kernel, `build.sh` mirrors the
+   vendor struct layouts for `net_device`, `sk_buff` and `napi_struct` (the last
+   appends the trailing `work_struct` of the vendor's `CONFIG_THREADED_NAPI`, or
+   `netif_napi_del` warns on every peer teardown).
 2. **`scripts/wg-shim`** — the thin shim (config→awg + dump-normalize).
 3. **Userspace boot** (`scripts/`): `install-module.sh` (make our module the
    active `wireguard`), `awg-boot.sh` (+`awg.rc.local`) installs the shim and
@@ -84,17 +88,20 @@ INSTALL_RC_LOCAL=1 ./deploy.sh root@192.168.1.1
 ```bash
 make verify
 # or on the router:
-/data/amneziawg/awg-status.sh
+/data/amneziawg/awg-status.sh            # 9-layer check, PASS/WARN/FAIL, exits non-zero on FAIL
+/data/amneziawg/awg-status.sh --wire     # also tcpdumps each endpoint for junk
 ```
 
-`awg-status.sh` reports module identity (the `iface_junk` param marks ours),
-genl family, the `iface_junk` map, and per-interface `wg show` + PBR + ifindex.
+`awg-status.sh` localizes faults across the whole stack: (1) module identity,
+(2) wg-shim mount, (3) `iface_junk` map, (4) udev+systemd autopopulate,
+(5) per-interface handshake / 10th dump column / PBR routing, (6) on-wire junk
+(`--wire`), (7) kernel health (recent vs historical dmesg warnings by age),
+(8) Mongo source-of-truth (enabled + junk/plain), (9) boot durability.
 
 Junk values are **invisible through any dump** by design (the dump-strip patch
-keeps `wg show` stock-compatible). Confirm obfuscation actually engaged via a
-working handshake through the blocking provider plus `tcpdump` on the WAN (junk
-packets / non-standard sizes before the handshake), or the temporary
-`pr_info` in `dmesg`.
+keeps `wg show` stock-compatible), so obfuscation itself is only confirmable via
+`--wire` (junk packets / non-standard sizes before the handshake) or a working
+handshake through the blocking provider — not from `wg show`.
 
 ## Roll back to stock WireGuard
 
@@ -115,6 +122,12 @@ ssh root@192.168.1.1 'rm -f /etc/udev/rules.d/99-amnezia-wgclt.rules; udevadm co
 - **Single point of obfuscation source:** Mongo schema (`ace.networkconf`,
   fields `wireguard_id` / `purpose` / `vpn_type` / `wireguard_client_configuration_file`).
   A UniFi update that renames these silently yields plain WireGuard.
+- **Built against stock headers, run on the vendor kernel.** The module compiles
+  against kernel.org 5.4.213 and hand-patches the vendor `net_device` / `sk_buff`
+  / `napi_struct` layouts to match (`build.sh` `patch_vendor_*`). A kernel bump
+  that changes any of those structs (or the offsets in the netdevice/skbuff
+  pads) needs the layout patches re-derived, or the module corrupts memory at
+  those offsets. Layer 7 of `awg-status.sh` catches the napi case at runtime.
 
 ## Files
 
