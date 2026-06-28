@@ -161,25 +161,25 @@
 ### Task 6: Suppress stock wireguard autoload/collision (boot-critical)
 
 **Files:**
-- Create: `scripts/install-module.sh` (replace `/lib/modules` + `depmod`, либо blacklist)
-- Create: `scripts/amneziawg.blacklist.conf` (если выбран blacklist-вариант)
+- Create: `scripts/install-module.sh` (replace `/lib/modules` + `depmod`)
 
-- [ ] выбрать и реализовать стратегию: (a) заменить `/lib/modules/$(uname -r)/kernel/net/wireguard/wireguard.ko` нашим + `depmod -a` (alias `rtnl-link-wireguard`/`family-wireguard` резолвят в наш; бэкап стока рядом), ИЛИ (b) blacklist стока в `/etc/modprobe.d` + гарантия порядка загрузки
-- [ ] закрыть гонку `rmmod→insmod`: если выбран insmod-by-path — убедиться, что нет окна автозагрузки стока между rmmod и insmod (предпочесть replace+depmod)
-- [ ] обработать `-EEXIST`: если семья/тип уже заняты стоком → явный громкий лог, не «тихий чистый WG»
-- [ ] verify (router): после применения `ip link add type wireguard` и genl-запрос семьи `wireguard` резолвят в НАШ модуль (есть `iface_junk`), не в сток; на reboot сток не перехватывает
+- [x] стратегия (a): заменить `/lib/modules/.../wireguard.ko` нашим + `depmod -a` → autoload `type wireguard` резолвит наш (нет гонки/`-EEXIST`); бэкап стока в `wireguard.ko.stock`. Маркер «наш» = parm `iface_junk`. `/lib/modules` writable (проверено)
+- [x] гонка `rmmod→insmod` снята: файл В `/lib/modules` уже наш → autoload берёт наш. rmmod стока только если нет живых iface (ранний boot), иначе громкий WARNING
+- [x] `-EEXIST` исключён by design (один `wireguard.ko` по имени); идемпотентно, переживает firmware-revert (re-run на boot)
+- [ ] verify (router): после применения `ip link add type wireguard`/genl-запрос резолвят в НАШ модуль (есть `iface_junk`); на reboot сток не перехватывает (pending — maintenance window)
 
 ### Task 7: Boot-populator + rc.local hook
 
 **Files:**
 - Create: `scripts/awg-boot.sh`
+- Create: `scripts/populate-junk.sh` (Mongo→sysfs, общий для boot и udev)
 - Create: `scripts/awg.rc.local` (заменяет `amneziawg.rc.local`)
 
-- [ ] `awg-boot.sh`: guard через `install-module.sh` (Task 6) — гарантировать, что загружен наш модуль (есть `iface_junk`)
-- [ ] прочитать из Mongo все enabled amnezia vpn-client (референс `fetch_db_record`), собрать `wgcltN=...;...`, записать в `iface_junk`; идемпотентно; пустой Mongo → пустая строка
-- [ ] `awg.rc.local`: ранний вызов `awg-boot.sh` (до подъёма туннелей udapi); лог в `/data/amneziawg/awg-boot.log`
-- [ ] verify (router): reboot → наш модуль активен, `wgclt30` (boot-known) поднимается с обфусцированным handshake (проходит сквозь провайдера), `dmesg`/`pr_info` подтверждает junk
-- [ ] verify: `ip -4 rule show | grep wgclt30` и таблица `179.wgclt30` целы
+- [x] `awg-boot.sh`: вызывает `install-module.sh` (гарантия нашего модуля), затем `populate-junk.sh`; лог в `awg-boot.log`
+- [x] `populate-junk.sh`: mongo (порт 27117, db ace) находит все enabled vpn-client, парсит `wireguard_client_configuration_file` (Jc/S1/H1/I1...→jc/s1/h1/i1), пишет TAB-формат в `iface_junk`; авторитетная полная перезапись; пустой Mongo → пустая строка
+- [x] `awg.rc.local`: вызов `awg-boot.sh` перед `exit 0`; задокументирован риск порядка после firmware-update
+- [ ] verify (router): reboot → наш модуль активен, `wgclt30` (boot-known) поднимается с обфусцированным handshake, `dmesg`/`pr_info` подтверждает junk (pending)
+- [ ] verify: `ip -4 rule show | grep wgclt30` и таблица `179.wgclt30` целы (pending)
 
 ### Task 8: Per-iface udev populator via systemd-run (cold-start)
 

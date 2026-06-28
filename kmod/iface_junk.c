@@ -172,15 +172,19 @@ static int iface_junk_set(const char *val, const struct kernel_param *kp)
 	mutex_unlock(&iface_junk_lock);
 	kfree(old);
 
-	/* Re-apply to already-live matching interfaces so tunnels created after
-	 * boot (udev path) pick up junk without a restart. Run outside
+	/* Re-apply to already-live interfaces that came up plain so tunnels
+	 * created after boot (udev path) pick up junk without a restart. We only
+	 * touch interfaces without advanced_security set: cold-started ones that
+	 * still need junk. Already-configured tunnels are left undisturbed
+	 * (changing their params requires a reconnect anyway). Run outside
 	 * iface_junk_lock -- wg_iface_junk_apply re-takes it via find_record --
 	 * and under RTNL so the device list is stable, matching the lock order
 	 * (rtnl -> device_update_lock) of the setconf path.
 	 */
 	rtnl_lock();
 	list_for_each_entry(wg, wg_device_list(), device_list)
-		wg_iface_junk_apply(wg);
+		if (!wg->advanced_security)
+			wg_iface_junk_apply(wg);
 	rtnl_unlock();
 	return 0;
 }
