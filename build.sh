@@ -251,6 +251,26 @@ patch_awg_rename_to_wireguard() {
     fi
 }
 
+patch_awg_netlink_compat() {
+    local netlink_c="$1"
+
+    # The UCG ships a UniFi-patched wireguard-tools whose `wg` sends a custom
+    # device-level attribute at index 9 (16 bytes), which collides with
+    # AmneziaWG's WGDEVICE_A_JC (NLA_U16). Under strict genl validation that
+    # length mismatch ("attribute type 9 has an invalid length") aborts the whole
+    # setconf, leaving the interface unconfigured. We don't need any AmneziaWG
+    # netlink attribute (junk comes from the iface_junk module param, not
+    # netlink), so relax validation to liberal: the incompatible attribute is
+    # skipped and the rest of the config (keys, peers, allowedips) applies.
+    # Confirmed on-router: setconf succeeds and the config is applied.
+    perl -0pi -e 's/\t\t\.cmd = WG_CMD_GET_DEVICE,\n/\t\t.cmd = WG_CMD_GET_DEVICE,\n\t\t.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,\n/' "${netlink_c}"
+    perl -0pi -e 's/\t\t\.cmd = WG_CMD_SET_DEVICE,\n/\t\t.cmd = WG_CMD_SET_DEVICE,\n\t\t.validate = GENL_DONT_VALIDATE_STRICT,\n/' "${netlink_c}"
+    if [ "$(grep -c 'GENL_DONT_VALIDATE_STRICT' "${netlink_c}")" -ne 2 ]; then
+        echo "ERROR: netlink validate relaxation not applied to both ops" >&2
+        exit 1
+    fi
+}
+
 patch_awg_iface_junk() {
     local kmod_dir="$1"
     local kbuild="$2"
@@ -392,6 +412,13 @@ patch_awg_rename_to_wireguard Kbuild uapi/wireguard.h
 # it into wg_newlink so junk is applied before the first packet. Must run after
 # the rename patch (it edits the renamed wireguard-y line).
 patch_awg_iface_junk /build/kmod Kbuild device.c
+
+# Patch 11 (netlink-compat): the UCG's UniFi-patched `wg` sends a custom device
+# attribute (index 9, 16 bytes) that collides with AmneziaWG's WGDEVICE_A_JC and
+# trips strict genl validation, aborting setconf. Relax validation to liberal so
+# the incompatible attribute is skipped and stock `wg setconf` from udapi
+# configures the interface (junk comes from iface_junk, not netlink).
+patch_awg_netlink_compat netlink.c
 
 make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} KERNELDIR="${KERNEL_DIR}" -j"$(nproc)"
 
