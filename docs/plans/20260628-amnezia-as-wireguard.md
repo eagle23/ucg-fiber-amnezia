@@ -127,23 +127,24 @@
 - Create: `src/iface_junk.c`, `src/iface_junk.h`
 - Modify: `src/Kbuild` (добавить `iface_junk.o` в `wireguard-y`); правки вносить патч-функцией в `build.sh`
 
-- [ ] `module_param_cb(iface_junk, &iface_junk_ops, ...)` права `0644`, хранить копию строки (`kstrdup`/`kfree`)
-- [ ] парсер записи по имени iface → `struct awg_junk` (jc/jmin/jmax/s1-s4/h1-h4/i1-i5); переиспользовать границы валидации `device.c:564-599`; держать минимальным (kernel-баг = oops)
-- [ ] `iface_junk_lookup(const char *ifname, struct awg_junk *out)` — наличие записи
-- [ ] `apply_junk_to_dev(struct wg_device *wg, const struct awg_junk *j)` под `wg->device_update_lock`; временный `pr_info(...)` с применёнными значениями (для отладки)
-- [ ] build-gate: сборка; на роутере `/sys/module/wireguard/parameters/iface_junk` существует, читается/пишется (≤PAGE_SIZE)
+- [x] `module_param_cb(iface_junk, &iface_junk_ops, 0644)` с собственным локом (не голый `charp` — иначе UAF при swap-гонке с newlink); хранит копию строки
+- [x] парсер TAB-формата `<ifname>\t<k>=<v>...` → зеркалит setconf; вместо дублирования валидации зовёт готовую `wg_device_handle_post_config()` (она и валидирует, и делает `jp_spec_setup`)
+- [x] `iface_junk_find_record(ifname)` — поиск записи по имени в строке параметра
+- [x] `wg_iface_junk_apply(wg)` под `wg->device_update_lock`; `pr_info` с применёнными jc/s1 (отладка), на ошибку — `advanced_security=false` + `net_warn`, fallback в plain WG
+- [x] build-gate: компиляция чистая; `modinfo` показывает parm `iface_junk`; символы `wg_iface_junk_apply`/`iface_junk_set/get` в `.ko` ✓
+- [ ] on-router: `/sys/module/wireguard/parameters/iface_junk` существует, читается/пишется (pending — maintenance window)
 
 ### Task 4: Apply junk on NEWLINK before register_netdevice
 
 **Files:**
 - Modify: `src/device.c` (в `wg_newlink`, до `register_netdevice` на :425) — через патч-функцию в `build.sh`
 
-- [ ] до `register_netdevice`: `iface_junk_lookup(dev->name, &j)` → при наличии `apply_junk_to_dev(wg, &j)` (junk с пакета №1, нет окна утечки)
-- [ ] инвариант: нет записи → junk=0 (обычный WireGuard), стандартный путь не регрессирует
-- [ ] битая запись → `pr_warn`, junk=0, iface всё равно поднимается
-- [ ] build-gate: сборка
-- [ ] verify (router): при заполненном `iface_junk` `ip link add wgcltX type wireguard` → `pr_info` в `dmesg` показывает ненулевой jc/s1; handshake поднимается сквозь провайдера
-- [ ] verify: без записи → `dmesg` показывает junk=0, ведёт себя как чистый WG
+- [x] до `register_netdevice` (под держащимся RTNL): `wg_iface_junk_apply(wg)` ищет запись по `dev->name` → применяет (junk с пакета №1). Хук врезан в `wg_newlink` (5.4 идёт через `wg_newlink_old`→`wg_newlink`, единая точка)
+- [x] инвариант: нет записи → `return 0`, junk=0 (обычный WireGuard), стандартный путь не регрессирует
+- [x] битая запись → `net_warn` + `advanced_security=false`, iface всё равно поднимается
+- [x] build-gate: компиляция чистая, хук-assert в `build.sh` пройден
+- [ ] verify (router): при заполненном `iface_junk` `ip link add wgcltX type wireguard` → `pr_info` в `dmesg` показывает ненулевой jc/s1; handshake поднимается сквозь провайдера (pending)
+- [ ] verify: без записи → `dmesg` показывает junk=0, ведёт себя как чистый WG (pending)
 
 ### Task 5: Retroactive apply in store-callback (walk live ifaces)
 
@@ -151,11 +152,11 @@
 - Modify: `src/device.c` (walk-функция — там видны `static link_ops`/`device_list`)
 - Modify: `src/iface_junk.c` (вызов walk из store-callback)
 
-- [ ] парсить новую строку ДО `rtnl_lock`; затем под `rtnl_lock()` `for_each_netdev` фильтр `rtnl_link_ops == &link_ops`, per-dev `device_update_lock` внутри (порядок rtnl→device_update_lock как в netlink-пути → без deadlock)
-- [ ] для совпавших по `dev->name` — `apply_junk_to_dev` (cold-start новых туннелей); идентичный Task 4 набор полей (идемпотентность)
-- [ ] build-gate: сборка
-- [ ] verify (router): поднять чистый `wgcltX`, затем `echo "wgcltX=jc:4,..." > .../iface_junk` → `dmesg` `pr_info` подтверждает применение без пересоздания iface; handshake восстанавливается
-- [ ] verify: `ip link show wgcltX` — ifindex не изменился (PBR цел)
+- [x] swap строки под `iface_junk_lock`, затем walk под `rtnl_lock()` по `wg_device_list()` (accessor к static `device_list`), `wg_iface_junk_apply` per-dev берёт `device_update_lock` внутри (порядок rtnl→device_update_lock как в netlink → без deadlock; walk вне `iface_junk_lock` — `find_record` берёт его заново)
+- [x] для каждого live-iface вызывается тот же `wg_iface_junk_apply` что и в newlink → идентичный набор полей (идемпотентно)
+- [x] build-gate: компиляция чистая, символ `wg_device_list` в `.ko` ✓
+- [ ] verify (router): поднять чистый `wgcltX`, затем `printf 'wgcltX\tjc=4\t...' > .../iface_junk` → `dmesg` подтверждает применение без пересоздания iface; handshake восстанавливается (pending)
+- [ ] verify: `ip link show wgcltX` — ifindex не изменился (PBR цел) (pending)
 
 ### Task 6: Suppress stock wireguard autoload/collision (boot-critical)
 

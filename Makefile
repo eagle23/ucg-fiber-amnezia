@@ -14,6 +14,7 @@ build:
 	docker run --rm \
 		-v $(CURDIR)/kernel.config:/build/kernel.config:ro \
 		-v $(CURDIR)/build.sh:/build/build.sh:ro \
+		-v $(CURDIR)/kmod:/build/kmod:ro \
 		-v $(CURDIR)/output:/build/output \
 		$(DOCKER_IMAGE) bash /build/build.sh
 

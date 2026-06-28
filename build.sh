@@ -240,6 +240,43 @@ patch_awg_rename_to_wireguard() {
     fi
 }
 
+patch_awg_iface_junk() {
+    local kmod_dir="$1"
+    local kbuild="$2"
+    local device_c="$3"
+
+    # Drop in the per-interface junk store and add it to the composite module.
+    cp "${kmod_dir}/iface_junk.c" "${kmod_dir}/iface_junk.h" .
+    sed -i 's/^wireguard-y := \(.*\)$/wireguard-y := \1 iface_junk.o/' "${kbuild}"
+    if ! grep -q 'iface_junk\.o' "${kbuild}"; then
+        echo "ERROR: iface_junk.o not added to Kbuild" >&2
+        exit 1
+    fi
+    # Inject junk into the device the moment it is created, before the first
+    # packet, so boot-known tunnels obfuscate their very first handshake. Both
+    # the new and the 5.4-compat newlink paths funnel through wg_newlink().
+    if ! grep -q '#include "iface_junk.h"' "${device_c}"; then
+        sed -i '/#include "messages.h"/a #include "iface_junk.h"' "${device_c}"
+    fi
+    perl -0pi -e 's@\tnetif_threaded_enable\(dev\);\n\tret = register_netdevice\(dev\);@\twg_iface_junk_apply(wg);\n\tnetif_threaded_enable(dev);\n\tret = register_netdevice(dev);@s' "${device_c}"
+    if ! grep -q 'wg_iface_junk_apply(wg);' "${device_c}"; then
+        echo "ERROR: iface_junk newlink hook not injected into wg_newlink" >&2
+        exit 1
+    fi
+    # Expose the (static) device_list so the iface_junk param store-callback can
+    # re-apply junk to already-live interfaces (cold-start of post-boot tunnels).
+    if ! grep -q 'wg_device_list(void)' "${device_c}"; then
+        cat >>"${device_c}" <<'AWG_EOF'
+
+/* UCGF: accessor for the static device_list, used by iface_junk reapply. */
+struct list_head *wg_device_list(void)
+{
+	return &device_list;
+}
+AWG_EOF
+    fi
+}
+
 # ============================================================
 # Step 1: Prepare kernel headers
 # ============================================================
@@ -339,6 +376,11 @@ patch_awg_ctor_safe_slab_allocs allowedips.c peer.c
 # it natively backs UI-created `ip link add type wireguard` interfaces and the
 # stock `wg` (which udapi uses for setconf/syncconf) talks straight to it.
 patch_awg_rename_to_wireguard Kbuild uapi/wireguard.h
+
+# Patch 10: add the per-interface junk store (iface_junk module param) and hook
+# it into wg_newlink so junk is applied before the first packet. Must run after
+# the rename patch (it edits the renamed wireguard-y line).
+patch_awg_iface_junk /build/kmod Kbuild device.c
 
 make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} KERNELDIR="${KERNEL_DIR}" -j"$(nproc)"
 
