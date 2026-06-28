@@ -6,9 +6,9 @@ EXTRAVERSION="-ui-ipq9574"
 KERNEL_DIR="/build/linux-${KERNEL_VERSION}"
 OUTPUT_DIR="/build/output"
 AMNEZIAWG_MODULE_REPO="https://github.com/amnezia-vpn/amneziawg-linux-kernel-module.git"
-AMNEZIAWG_MODULE_REF="${AMNEZIAWG_MODULE_REF:-v1.0.20260322}"
-AMNEZIAWG_TOOLS_REPO="https://github.com/amnezia-vpn/amneziawg-tools.git"
-AMNEZIAWG_TOOLS_REF="${AMNEZIAWG_TOOLS_REF:-v1.0.20260223}"
+AMNEZIAWG_MODULE_REF="${AMNEZIAWG_MODULE_REF:-v1.0.20260611}"
+# amneziawg-tools are no longer built (stock wg/wg-quick on the UCG suffice;
+# junk is injected kernel-side via the iface_junk module param).
 
 ARCH="arm64"
 CROSS_COMPILE="aarch64-linux-gnu-"
@@ -312,8 +312,14 @@ patch_awg_socket_ipv6_fallback socket.c
 
 # Patch 5: AWG's extended dump path trips nlmsg_trim() on this BSP during
 # "awg show". Keep the setconf path intact, but dump only the upstream-safe
-# core attrs for now.
+# core attrs for now. SECURITY-CRITICAL: if this silently fails to apply (e.g.
+# after an upstream bump rewrites the dump block), junk attrs would leak into
+# `wg show` and break the stock-wg/UI compatibility, so assert it applied.
 patch_awg_device_dump netlink.c
+if grep -q 'nla_put_u16(skb, WGDEVICE_A_JC' netlink.c; then
+    echo "ERROR: patch_awg_device_dump did not strip junk from the dump path (upstream source changed?)" >&2
+    exit 1
+fi
 
 # Patch 6: make module unload deterministic by unregistering any lingering
 # interfaces during module exit and waiting for deferred peer RCU frees before

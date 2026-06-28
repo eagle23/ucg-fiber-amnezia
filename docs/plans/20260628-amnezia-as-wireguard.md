@@ -15,7 +15,7 @@
 
 ## Context (from discovery)
 
-**Исходники модуля** (`build.sh`, ref `v1.0.20260322`, репо `amnezia-vpn/amneziawg-linux-kernel-module`, src в `/build/amneziawg-linux-kernel-module/src`):
+**Исходники модуля** (`build.sh`, ref `v1.0.20260611` — последний апстрим; бамп с `20260322` безопасен, дельты только багфиксы `ispecs.desc`/init ispec-локов, патчируемые участки не задеты; репо `amnezia-vpn/amneziawg-linux-kernel-module`, src в `/build/amneziawg-linux-kernel-module/src`):
 - `src/Kbuild:11,24` — имя модуля: `amneziawg-y := ...`, `obj-... := amneziawg.o` → задаёт `KBUILD_MODNAME = "amneziawg"`.
 - `src/uapi/wireguard.h:160` — `#define WG_GENL_NAME "amneziawg"` (и `:161` `WG_GENL_VERSION 2`).
 - `src/device.c:481` — `.kind = KBUILD_MODNAME` (rtnl link type).
@@ -110,7 +110,7 @@
 - [x] вызвать функцию в секции патчей (Patch 9, до `make`)
 - [x] заменить `modinfo amneziawg.ko`/`cp amneziawg.ko` на `wireguard.ko`; сохранить vermagic-проверку
 - [x] подтвердить, что `.kind`/`device_type.name`/`MODULE_ALIAS_*`/`netlink.c:101` подхватывают имя через макросы (точечных правок не требуется); slab `*_ucgf` оставить как есть
-- [ ] build-gate: `make build` проходит; `modinfo output/wireguard.ko` → имя `wireguard`, `alias rtnl-link-wireguard` + `net-pf-16-proto-16-family-wireguard`, vermagic `5.4.213-ui-ipq9574`
+- [x] build-gate: `make build` проходит; `modinfo output/wireguard.ko` → имя `wireguard`, `alias rtnl-link-wireguard` + `net-pf-16-proto-16-family-wireguard`, vermagic `5.4.213-ui-ipq9574` ✓ (Docker build exit 0)
 
 ### Task 2: Stop building amneziawg-tools
 
