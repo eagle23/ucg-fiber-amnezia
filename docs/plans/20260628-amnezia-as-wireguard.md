@@ -104,22 +104,22 @@
 
 **Files:**
 - Modify: `build.sh` (новая функция `patch_awg_rename_to_wireguard` + вызов + переименование артефакта)
+- Modify: `Makefile` (`compare-amnezia` артефакт `wireguard.ko`)
 
-- [ ] добавить `patch_awg_rename_to_wireguard()` рядом с прочими `patch_awg_*`: `sed` по `src/Kbuild` (`amneziawg-y`→`wireguard-y`, `:= amneziawg.o`→`wireguard.o` → `KBUILD_MODNAME="wireguard"`) и `src/uapi/wireguard.h` (`WG_GENL_NAME "amneziawg"`→`"wireguard"`)
-- [ ] вызвать функцию в секции патчей (`build.sh:288-307`), до `make`
-- [ ] заменить `modinfo amneziawg.ko`/`cp amneziawg.ko` на `wireguard.ko` (`build.sh:312,315-316`); сохранить vermagic-проверку
-- [ ] подтвердить, что `.kind`/`device_type.name`/`MODULE_ALIAS_*`/`netlink.c:101` подхватывают имя через макросы (точечных правок не требуется); slab `*_ucgf` оставить как есть
+- [x] добавить `patch_awg_rename_to_wireguard()` рядом с прочими `patch_awg_*`: `sed` по `Kbuild` (`amneziawg-y`→`wireguard-y`, `:= amneziawg.o`→`wireguard.o` → `KBUILD_MODNAME="wireguard"`) и `uapi/wireguard.h` (`WG_GENL_NAME "amneziawg"`→`"wireguard"`) + assert'ы применения
+- [x] вызвать функцию в секции патчей (Patch 9, до `make`)
+- [x] заменить `modinfo amneziawg.ko`/`cp amneziawg.ko` на `wireguard.ko`; сохранить vermagic-проверку
+- [x] подтвердить, что `.kind`/`device_type.name`/`MODULE_ALIAS_*`/`netlink.c:101` подхватывают имя через макросы (точечных правок не требуется); slab `*_ucgf` оставить как есть
 - [ ] build-gate: `make build` проходит; `modinfo output/wireguard.ko` → имя `wireguard`, `alias rtnl-link-wireguard` + `net-pf-16-proto-16-family-wireguard`, vermagic `5.4.213-ui-ipq9574`
 
-### Task 2: Stop building/deploying amneziawg-tools
+### Task 2: Stop building amneziawg-tools
 
 **Files:**
 - Modify: `build.sh` (убрать секцию сборки `awg`/`awg-quick`)
-- Modify: `Makefile`/`deploy.sh` (убрать `output/awg`,`output/awg-quick` из артефактов/scp)
 
-- [ ] удалить/закомментировать сборку amneziawg-tools в `build.sh` (стоковый `wg`+`wg-quick` уже на роутере, udapi использует `wg setconf/syncconf`)
-- [ ] убрать `awg`/`awg-quick` из `output`-списков `Makefile`/`deploy.sh`
-- [ ] build-gate: `make build` даёт только `output/wireguard.ko`; на роутере `wg show wgclt30` работает против нашего модуля (семья `wireguard`)
+- [x] удалить секцию сборки amneziawg-tools в `build.sh` (стоковый `wg`+`wg-quick` уже на роутере, udapi использует `wg setconf/syncconf`)
+- [ ] build-gate: `make build` даёт только `output/wireguard.ko` (без `awg`/`awg-quick`); на роутере `wg show wgclt30` работает против нашего модуля (семья `wireguard`)
+- *Примечание:* удаление `awg`/`awg-quick` из `deploy.sh` и target `verify` в `Makefile` консолидировано в Task 10 (там `deploy.sh` переписывается целиком под новый дизайн — частичная правка дала бы несогласованный файл).
 
 ### Task 3: Add writable per-iface junk-store module param + parser
 

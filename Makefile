@@ -31,7 +31,7 @@ compare-wireguard:
 	./compare-wireguard.sh $(CURDIR)/wireguard-device.ko $(CURDIR)/output/wireguard-vanilla.ko $(CURDIR)/output/wireguard-compare
 
 compare-amnezia:
-	MODULE_A_LABEL=amnezia MODULE_B_LABEL=vanilla ./compare-wireguard.sh $(CURDIR)/output/amneziawg.ko $(CURDIR)/output/wireguard-vanilla.ko $(CURDIR)/output/amnezia-compare
+	MODULE_A_LABEL=amnezia MODULE_B_LABEL=vanilla ./compare-wireguard.sh $(CURDIR)/output/wireguard.ko $(CURDIR)/output/wireguard-vanilla.ko $(CURDIR)/output/amnezia-compare
 
 analyze-wireguard: build-wireguard-vanilla compare-wireguard
 

@@ -217,6 +217,29 @@ patch_awg_ctor_safe_slab_allocs() {
     perl -0pi -e 's@kmem_cache_zalloc\(node_cache, GFP_KERNEL\)@wg_allowedips_node_alloc()@g' "${allowedips_c}"
 }
 
+patch_awg_rename_to_wireguard() {
+    local kbuild="$1"
+    local uapi_h="$2"
+
+    # Register the module under the name "wireguard" so it fully displaces the
+    # stock wireguard.ko on the UCG: KBUILD_MODNAME drives the rtnl-link .kind,
+    # device_type.name, MODULE_ALIAS_RTNL_LINK, the netlink consistency check and
+    # pr_fmt. The composite-module name (<mod>-y / obj-... := <mod>.o) must match,
+    # so both lines are renamed together and the artifact becomes wireguard.ko.
+    sed -i 's/^amneziawg-y :=/wireguard-y :=/' "${kbuild}"
+    sed -i 's/:= amneziawg\.o$/:= wireguard.o/' "${kbuild}"
+    if ! grep -q '^wireguard-y :=' "${kbuild}" || ! grep -q ':= wireguard\.o$' "${kbuild}"; then
+        echo "ERROR: Kbuild rename to wireguard did not apply" >&2
+        exit 1
+    fi
+    # genl family name + MODULE_ALIAS_GENL_FAMILY resolve through WG_GENL_NAME.
+    sed -i 's/#define WG_GENL_NAME "amneziawg"/#define WG_GENL_NAME "wireguard"/' "${uapi_h}"
+    if ! grep -q '#define WG_GENL_NAME "wireguard"' "${uapi_h}"; then
+        echo "ERROR: WG_GENL_NAME rename to wireguard did not apply" >&2
+        exit 1
+    fi
+}
+
 # ============================================================
 # Step 1: Prepare kernel headers
 # ============================================================
@@ -244,9 +267,9 @@ if [ "${RELEASE}" != "${EXPECTED}" ]; then
 fi
 
 # ============================================================
-# Step 2: Build AmneziaWG kernel module
+# Step 2: Build AmneziaWG kernel module (registered as "wireguard")
 # ============================================================
-echo "=== Building amneziawg.ko ==="
+echo "=== Building wireguard.ko (AmneziaWG renamed) ==="
 
 cd /build
 checkout_repo_ref /build/amneziawg-linux-kernel-module "${AMNEZIAWG_MODULE_REPO}" "${AMNEZIAWG_MODULE_REF}"
@@ -306,29 +329,25 @@ patch_awg_unique_slab_names main.c allowedips.c peer.c
 # non-mergeable caches, but zero objects explicitly after kmem_cache_alloc().
 patch_awg_ctor_safe_slab_allocs allowedips.c peer.c
 
+# Patch 9: register the module as "wireguard" (rtnl-link type + genl family) so
+# it natively backs UI-created `ip link add type wireguard` interfaces and the
+# stock `wg` (which udapi uses for setconf/syncconf) talks straight to it.
+patch_awg_rename_to_wireguard Kbuild uapi/wireguard.h
+
 make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} KERNELDIR="${KERNEL_DIR}" -j"$(nproc)"
 
 # Verify vermagic
-VERMAGIC=$(modinfo amneziawg.ko 2>/dev/null | grep vermagic | awk '{print $2, $3, $4, $5, $6}' || true)
+VERMAGIC=$(modinfo wireguard.ko 2>/dev/null | grep vermagic | awk '{print $2, $3, $4, $5, $6}' || true)
 echo "Module vermagic: ${VERMAGIC}"
 
-cp amneziawg.ko "${OUTPUT_DIR}/"
-echo "Built: ${OUTPUT_DIR}/amneziawg.ko"
+cp wireguard.ko "${OUTPUT_DIR}/"
+echo "Built: ${OUTPUT_DIR}/wireguard.ko"
 
-# ============================================================
-# Step 3: Build awg userspace tool
-# ============================================================
-echo "=== Building awg userspace tool ==="
-
-cd /build
-checkout_repo_ref /build/amneziawg-tools "${AMNEZIAWG_TOOLS_REPO}" "${AMNEZIAWG_TOOLS_REF}"
-
-cd amneziawg-tools/src
-make CC="${CROSS_COMPILE}gcc" -j"$(nproc)"
-
-cp wg "${OUTPUT_DIR}/awg"
-cp wg-quick/linux.bash "${OUTPUT_DIR}/awg-quick"
-echo "Built: ${OUTPUT_DIR}/awg, ${OUTPUT_DIR}/awg-quick"
+# Userspace amneziawg-tools are intentionally NOT built: the UCG already ships
+# stock wg/wg-quick (wireguard-tools), udapi configures tunnels via
+# `wg setconf`/`wg syncconf`, and junk params are injected kernel-side from the
+# `iface_junk` module param. The renamed genl family makes stock `wg` talk to
+# this module directly, so no separate `awg` binary is needed.
 
 # ============================================================
 # Done
