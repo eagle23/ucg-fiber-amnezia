@@ -21,9 +21,16 @@ fi
 
 ssh "${ROUTER}" "mkdir -p ${REMOTE_DIR}"
 
-echo "Copying module + scripts..."
+if [ ! -f "${SCRIPT_DIR}/output/awg" ]; then
+	echo "ERROR: ${SCRIPT_DIR}/output/awg not found. Run 'make build' first." >&2
+	exit 1
+fi
+
+echo "Copying module + awg + scripts..."
 scp -p \
 	"${SCRIPT_DIR}/output/wireguard.ko" \
+	"${SCRIPT_DIR}/output/awg" \
+	"${SCRIPT_DIR}/scripts/wg-shim" \
 	"${SCRIPT_DIR}/scripts/install-module.sh" \
 	"${SCRIPT_DIR}/scripts/populate-junk.sh" \
 	"${SCRIPT_DIR}/scripts/awg-boot.sh" \
@@ -34,8 +41,8 @@ scp -p \
 	"${ROUTER}:${REMOTE_DIR}/"
 
 ssh "${ROUTER}" "
-	chmod +x ${REMOTE_DIR}/install-module.sh ${REMOTE_DIR}/populate-junk.sh \
-	         ${REMOTE_DIR}/awg-boot.sh ${REMOTE_DIR}/awg-status.sh
+	chmod +x ${REMOTE_DIR}/awg ${REMOTE_DIR}/wg-shim ${REMOTE_DIR}/install-module.sh \
+	         ${REMOTE_DIR}/populate-junk.sh ${REMOTE_DIR}/awg-boot.sh ${REMOTE_DIR}/awg-status.sh
 	uname -r > ${REMOTE_DIR}/.kernel-version
 "
 
@@ -67,8 +74,10 @@ Persist across reboot:
   (or add '${REMOTE_DIR}/awg-boot.sh' to /etc/rc.local before 'exit 0')
 
 Roll back to stock WireGuard:
-  ssh ${ROUTER} 'cp /lib/modules/\$(uname -r)/kernel/net/wireguard/wireguard.ko.stock \\
-      /lib/modules/\$(uname -r)/kernel/net/wireguard/wireguard.ko && depmod -a'
-  ssh ${ROUTER} 'rm -f /etc/udev/rules.d/99-amnezia-wgclt.rules; udevadm control --reload-rules'
-  then reboot.
+  ssh ${ROUTER} 'umount \$(command -v wg) 2>/dev/null
+      KREL=\$(uname -r); MODDIR=/lib/modules/\$KREL/kernel/net/wireguard
+      cp \$MODDIR/wireguard.ko.stock \$MODDIR/wireguard.ko && depmod -a
+      rmmod wireguard 2>/dev/null; modprobe wireguard
+      rm -f /etc/udev/rules.d/99-amnezia-wgclt.rules; udevadm control --reload-rules
+      systemctl restart udapi-server.service'
 EOF

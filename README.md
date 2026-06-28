@@ -5,40 +5,44 @@ with the UniFi UI.
 
 ## Idea
 
-Instead of intercepting `wg` with a bind-mount shim, the AmneziaWG kernel module
-is rebuilt to **register under the name `wireguard`**, fully displacing the stock
-`wireguard.ko`. UI-created `wgcltN` interfaces (`ip link add type wireguard`) are
-then natively AmneziaWG-capable, and the stock `wg` that udapi uses for
-`setconf`/`syncconf` talks straight to our module.
+The AmneziaWG kernel module is rebuilt to **register under the name `wireguard`**,
+displacing the stock `wireguard.ko`. So UI-created `wgcltN` interfaces
+(`ip link add type wireguard`) ARE our AmneziaWG module — the interface is never
+recreated, so its ifindex and the UCG policy routing stay intact (no
+dump-multiplex / type-conversion / PBR-repair the old shim needed).
 
-The obfuscation (junk) params never travel through udapi's config path, so they
-are supplied out of band via a writable `iface_junk` module param, populated from
-Mongo at boot and on udev interface-add, and applied **in the kernel before the
-first packet** — so the very first handshake is already obfuscated.
+But udapi's UniFi-patched `wg` cannot configure our module (its custom netlink
+attributes collide with AmneziaWG's), and udapi decides a tunnel is "Established"
+(and only then routes it) from an extra 10th column in `wg show all dump`. So a
+**thin `wg-shim`** (bind-mounted over `/usr/bin/wg`) bridges exactly two gaps:
 
-This removes the shim's dump multiplexing, interface-type conversion and PBR
-repair: the interface is never recreated, so its ifindex and the UCG policy
-routing stay intact.
+- `setconf`/`syncconf wgclt*` → redirect to **`awg`** (amneziawg-tools rebuilt
+  under the same `wireguard` genl family), which speaks the module's ABI;
+- `wg show all dump` → synthesize the 10th "forced-handshake" field for wgclt*
+  peer rows so udapi marks the tunnel Established and adds its own
+  `default dev wgcltN proto VPN` route.
 
-### Two layers
+Obfuscation (junk: `Jc/S1/H1/I1`...) is stripped by udapi from the config it
+generates, so it is supplied out of band via a writable **`iface_junk`** module
+param, populated from Mongo and applied kernel-side (device-level), independent
+of the awg config. Verified end-to-end: a UI WireGuard client with Amnezia junk
+obfuscates its handshake (Jc junk packets + I1 ispec on the wire), the Amnezia
+server responds, and the UI shows Established.
 
-1. **Kernel** — `amneziawg` rebuilt as `wireguard` (see `build.sh`,
-   `kmod/iface_junk.{c,h}`):
-   - rtnl-link type + genl family renamed to `wireguard`;
-   - `iface_junk` module param: `<ifname>\t<key>=<value>\t...\n...` (TAB-delimited);
-   - applied in `wg_newlink` before `register_netdevice`, and re-applied to
-     cold-started interfaces when the param is rewritten.
-2. **Userspace** (`scripts/`, no daemons, no cron):
-   - `install-module.sh` — make our module the active `wireguard` (replace in
-     `/lib/modules` + `depmod`);
-   - `populate-junk.sh` — build `iface_junk` from Mongo for all enabled tunnels;
-   - `awg-boot.sh` + `awg.rc.local` — boot entrypoint;
-   - `awg-populate@.service` + `99-amnezia-wgclt.rules` — udev hook for tunnels
-     added after boot.
+### Pieces
 
-**Invariant:** an interface with no record in `iface_junk` gets `junk=0` and
-behaves as plain WireGuard — so any non-Amnezia tunnel (Teleport, site-to-site,
-wg-server) keeps working.
+1. **Kernel** — `amneziawg` rebuilt as `wireguard` (`build.sh`,
+   `kmod/iface_junk.{c,h}`): renamed rtnl-link/genl family; `iface_junk` module
+   param (`<ifname>\t<key>=<value>\t...`) applied in `wg_newlink` and re-applied
+   when the param is rewritten.
+2. **`scripts/wg-shim`** — the thin shim (config→awg + dump-normalize).
+3. **Userspace boot** (`scripts/`): `install-module.sh` (make our module the
+   active `wireguard`), `awg-boot.sh` (+`awg.rc.local`) installs the shim and
+   runs `populate-junk.sh` (Mongo → `iface_junk`); `awg-populate@.service` +
+   `99-amnezia-wgclt.rules` re-populate on post-boot tunnel adds.
+
+**Invariant:** an interface with no `iface_junk` record gets `junk=0` and behaves
+as plain WireGuard, so non-junk tunnels keep working.
 
 ## Build
 
@@ -49,8 +53,8 @@ make build
 ```
 
 Produces `output/wireguard.ko` (AmneziaWG registered as `wireguard`,
-`v1.0.20260611`). No `awg`/`awg-quick` are built — the UCG ships stock
-`wg`/`wg-quick`.
+`v1.0.20260611`) and `output/awg` (amneziawg-tools rebuilt under the `wireguard`
+genl family — the shim drives our module through it).
 
 ## Deploy
 
