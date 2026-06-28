@@ -1,0 +1,14 @@
+#!/bin/sh
+# /etc/rc.local for AmneziaWG-as-wireguard on UCG-Fiber (run by rc-local.service).
+#
+# If you already use rc.local for other things, do NOT overwrite it -- instead
+# add the awg-boot.sh line below before your existing `exit 0`.
+#
+# Note on firmware updates: an update reverts /lib/modules to the stock
+# wireguard.ko. install-module.sh re-asserts our module on the next boot, but if
+# udapi autoloads stock and brings a tunnel up before this runs, that one boot
+# may run on stock (no obfuscation) until the following reboot.
+
+/data/amneziawg/awg-boot.sh || true
+
+exit 0

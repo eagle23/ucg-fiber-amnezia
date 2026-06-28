@@ -14,6 +14,7 @@ build:
 	docker run --rm \
 		-v $(CURDIR)/kernel.config:/build/kernel.config:ro \
 		-v $(CURDIR)/build.sh:/build/build.sh:ro \
+		-v $(CURDIR)/kmod:/build/kmod:ro \
 		-v $(CURDIR)/output:/build/output \
 		$(DOCKER_IMAGE) bash /build/build.sh
 
@@ -31,7 +32,7 @@ compare-wireguard:
 	./compare-wireguard.sh $(CURDIR)/wireguard-device.ko $(CURDIR)/output/wireguard-vanilla.ko $(CURDIR)/output/wireguard-compare
 
 compare-amnezia:
-	MODULE_A_LABEL=amnezia MODULE_B_LABEL=vanilla ./compare-wireguard.sh $(CURDIR)/output/amneziawg.ko $(CURDIR)/output/wireguard-vanilla.ko $(CURDIR)/output/amnezia-compare
+	MODULE_A_LABEL=amnezia MODULE_B_LABEL=vanilla ./compare-wireguard.sh $(CURDIR)/output/wireguard.ko $(CURDIR)/output/wireguard-vanilla.ko $(CURDIR)/output/amnezia-compare
 
 analyze-wireguard: build-wireguard-vanilla compare-wireguard
 
@@ -41,9 +42,8 @@ deploy:
 	./deploy.sh $(ROUTER_HOST)
 
 verify:
-	ssh $(ROUTER_HOST) "lsmod | grep amneziawg"
-	ssh $(ROUTER_HOST) "/data/amneziawg/awg --version"
-	ssh $(ROUTER_HOST) "ip link add awg-test type amneziawg && ip link del awg-test && echo 'Interface test OK'"
+	ssh $(ROUTER_HOST) "[ -e /sys/module/wireguard/parameters/iface_junk ] && echo 'OUR module active (iface_junk present)' || echo 'STOCK or not loaded'"
+	ssh $(ROUTER_HOST) "/data/amneziawg/awg-status.sh"
 
 clean:
 	rm -rf $(OUTPUT_DIR)/*

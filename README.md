@@ -1,232 +1,141 @@
 # unifi-amneziawg
 
-Порт AmneziaWG под UniFi router.
+AmneziaWG on a UniFi UCG-Fiber router (kernel `5.4.213-ui-ipq9574`), integrated
+with the UniFi UI.
 
-В репе сейчас есть три рабочих куска:
+## Idea
 
-1. patched `amneziawg.ko` для kernel `5.4.213-ui-ipq9574`
-2. userspace `awg` и `awg-quick`
-3. `wg-shim`, который перехватывает `wg syncconf/setconf` от UniFi UI, читает исходный AWG-конфиг из Mongo `ace.networkconf`, пересоздаёт `wgcltN` как `amneziawg` и долечивает PBR
+The AmneziaWG kernel module is rebuilt to **register under the name `wireguard`**,
+displacing the stock `wireguard.ko`. So UI-created `wgcltN` interfaces
+(`ip link add type wireguard`) ARE our AmneziaWG module — the interface is never
+recreated, so its ifindex and the UCG policy routing stay intact (no
+dump-multiplex / type-conversion / PBR-repair the old shim needed).
 
-## Что сейчас умеет
+But udapi's UniFi-patched `wg` cannot configure our module (its custom netlink
+attributes collide with AmneziaWG's), and udapi decides a tunnel is "Established"
+(and only then routes it) from an extra 10th column in `wg show all dump`. So a
+**thin `wg-shim`** (bind-mounted over `/usr/bin/wg`) bridges exactly two gaps:
 
-- `output/amneziawg.ko` загружается на роутер
-- `output/awg` и `output/awg-quick` поднимают AWG вручную
-- `scripts/wg-shim` позволяет включать клиентский VPN через UniFi UI и забирать AWG-поля из БД, а не из временного `wg syncconf` файла
-- `wg-shim` восстанавливает policy routing не только в момент `syncconf`, но и во время регулярного `wg show all dump`, потому что UCG дорисовывает свои `ip rule` позже
+- `setconf`/`syncconf wgclt*` → redirect to **`awg`** (amneziawg-tools rebuilt
+  under the same `wireguard` genl family), which speaks the module's ABI;
+- `wg show all dump` → synthesize the 10th "forced-handshake" field for wgclt*
+  peer rows so udapi marks the tunnel Established and adds its own
+  `default dev wgcltN proto VPN` route.
 
-Ограничения:
+Obfuscation (junk: `Jc/S1/H1/I1`...) is stripped by udapi from the config it
+generates, so it is supplied out of band via a writable **`iface_junk`** module
+param, populated from Mongo and applied kernel-side (device-level), independent
+of the awg config. Verified end-to-end: a UI WireGuard client with Amnezia junk
+obfuscates its handshake (Jc junk packets + I1 ispec on the wire), the Amnezia
+server responds, and the UI shows Established.
 
-- поддержан путь для `vpn-client` / `wgcltN`
-- `wgsrvN` этим shim пока не ведётся
-- `mark` и `lookup table` у UCG runtime-only, хардкодить их нельзя
+### Pieces
 
-## Сборка
+1. **Kernel** — `amneziawg` rebuilt as `wireguard` (`build.sh`,
+   `kmod/iface_junk.{c,h}`): renamed rtnl-link/genl family; `iface_junk` module
+   param (`<ifname>\t<key>=<value>\t...`) applied in `wg_newlink` and re-applied
+   when the param is rewritten. Because it builds against **stock** kernel.org
+   5.4.213 headers but runs on the UCG vendor kernel, `build.sh` mirrors the
+   vendor struct layouts for `net_device`, `sk_buff` and `napi_struct` (the last
+   appends the trailing `work_struct` of the vendor's `CONFIG_THREADED_NAPI`, or
+   `netif_napi_del` warns on every peer teardown).
+2. **`scripts/wg-shim`** — the thin shim (config→awg + dump-normalize).
+3. **Userspace boot** (`scripts/`): `install-module.sh` (make our module the
+   active `wireguard`), `awg-boot.sh` (+`awg.rc.local`) installs the shim and
+   runs `populate-junk.sh` (Mongo → `iface_junk`); `awg-populate@.service` +
+   `99-amnezia-wgclt.rules` re-populate on post-boot tunnel adds.
 
-Нужен Docker.
+**Invariant:** an interface with no `iface_junk` record gets `junk=0` and behaves
+as plain WireGuard, so non-junk tunnels keep working.
 
-Собрать AmneziaWG:
+## Build
+
+Needs Docker.
 
 ```bash
 make build
 ```
 
-Результат:
+Produces `output/wireguard.ko` (AmneziaWG registered as `wireguard`,
+`v1.0.20260611`) and `output/awg` (amneziawg-tools rebuilt under the `wireguard`
+genl family — the shim drives our module through it).
 
-- `output/amneziawg.ko`
-- `output/awg`
-- `output/awg-quick`
+## Deploy
 
-## Минимальный деплой на роутер
-
-Если нужен только AWG вручную, без интеграции с UI:
+Non-disruptive (copies module + scripts, installs udev rule + systemd unit):
 
 ```bash
-scp \
-  output/amneziawg.ko \
-  output/awg \
-  output/awg-quick \
-  root@192.168.1.1:/data/amneziawg/
+make deploy            # or: ./deploy.sh root@192.168.1.1
 ```
 
-Если нужен путь через UniFi UI и `wg-shim`:
+Activate the module (**disruptive** — swaps the wireguard module and briefly
+drops wg tunnels; do it in a maintenance window):
 
 ```bash
-scp \
-  output/amneziawg.ko \
-  output/awg \
-  output/awg-quick \
-  scripts/wg-shim \
-  scripts/install-wg-shim.sh \
-  scripts/uninstall-wg-shim.sh \
-  scripts/restore-managed-iface.sh \
-  root@192.168.1.1:/data/amneziawg/
+ssh root@192.168.1.1 /data/amneziawg/awg-boot.sh
+ssh root@192.168.1.1 /data/amneziawg/awg-status.sh
 ```
 
-Потом на роутере:
+Persist across reboot:
 
 ```bash
-chmod +x /data/amneziawg/awg \
-         /data/amneziawg/awg-quick \
-         /data/amneziawg/wg-shim \
-         /data/amneziawg/install-wg-shim.sh \
-         /data/amneziawg/uninstall-wg-shim.sh \
-         /data/amneziawg/restore-managed-iface.sh
-
-rmmod amneziawg 2>/dev/null || true
-insmod /data/amneziawg/amneziawg.ko
-/data/amneziawg/install-wg-shim.sh /data/amneziawg/wg-shim
+INSTALL_RC_LOCAL=1 ./deploy.sh root@192.168.1.1
+# or add /data/amneziawg/awg-boot.sh to /etc/rc.local before `exit 0`
 ```
 
-После этого UniFi UI продолжает вызывать обычный `wg`, а shim:
-
-- ловит `wg syncconf` / `wg setconf`
-- вытаскивает `wireguard_id` из имени `wgcltN`
-- читает `wireguard_client_configuration_file` из Mongo
-- если там есть AWG-поля и профиль включён, переводит интерфейс в `amneziawg`
-
-## Как это работает на роутере
-
-Проверено, что `ubios-udapi-server` использует:
+## Verify
 
 ```bash
-wg show all dump
-wg syncconf wgcltN /run/wireguard_*.config
+make verify
+# or on the router:
+/data/amneziawg/awg-status.sh            # 9-layer check, PASS/WARN/FAIL, exits non-zero on FAIL
+/data/amneziawg/awg-status.sh --wire     # also tcpdumps each endpoint for junk
 ```
 
-То есть `wg-quick` для UI не участвует.
+`awg-status.sh` localizes faults across the whole stack: (1) module identity,
+(2) wg-shim mount, (3) `iface_junk` map, (4) udev+systemd autopopulate,
+(5) per-interface handshake / 10th dump column / PBR routing, (6) on-wire junk
+(`--wire`), (7) kernel health (recent vs historical dmesg warnings by age),
+(8) Mongo source-of-truth (enabled + junk/plain), (9) boot durability.
 
-Поэтому основной путь интеграции такой:
+Junk values are **invisible through any dump** by design (the dump-strip patch
+keeps `wg show` stock-compatible), so obfuscation itself is only confirmable via
+`--wire` (junk packets / non-standard sizes before the handshake) or a working
+handshake through the blocking provider — not from `wg show`.
 
-1. UniFi UI создаёт или обновляет `wgcltN`
-2. `wg-shim` перехватывает `syncconf`
-3. берёт полный AWG-конфиг из `ace.networkconf`
-4. создаёт `amneziawg` под тем же именем интерфейса
-5. восстанавливает адреса, маршруты и policy routing
-
-## Файлы в репе
-
-Основные:
-
-- `build.sh` — сборка patched AmneziaWG
-- `Makefile` — удобные команды `make build` и `make deploy`
-- `kernel.config` — kernel config, которым кормится сборка
-- `patches/ucg-fiber-amneziawg.patch` — патч для AWG source
-
-Скрипты для роутера:
-
-- `scripts/wg-shim`
-- `scripts/install-wg-shim.sh`
-- `scripts/uninstall-wg-shim.sh`
-- `scripts/restore-managed-iface.sh`
-
-Опционально:
-
-- `scripts/amneziawg.rc.local` — если хочешь автозагрузку через штатный `rc-local.service`
-
-Готовые артефакты:
-
-- `output/amneziawg.ko`
-- `output/awg`
-- `output/awg-quick`
-
-## Автозагрузка через rc.local
-
-Если после reboot модуль не поднимается, на `UCG Fiber` проще не завязываться на отдельный `systemd` unit, а использовать штатный `rc-local.service`.
-
-Скопировать:
+## Roll back to stock WireGuard
 
 ```bash
-scp \
-  output/amneziawg.ko \
-  output/awg \
-  output/awg-quick \
-  scripts/wg-shim \
-  scripts/install-wg-shim.sh \
-  scripts/amneziawg.rc.local \
-  root@192.168.1.1:/data/amneziawg/
+ssh root@192.168.1.1 'cp /lib/modules/$(uname -r)/kernel/net/wireguard/wireguard.ko.stock \
+    /lib/modules/$(uname -r)/kernel/net/wireguard/wireguard.ko && depmod -a'
+ssh root@192.168.1.1 'rm -f /etc/udev/rules.d/99-amnezia-wgclt.rules; udevadm control --reload-rules'
+# remove the awg-boot.sh hook from /etc/rc.local, then reboot
 ```
 
-Потом на роутере:
+## Caveats
 
-```bash
-chmod +x /data/amneziawg/awg /data/amneziawg/awg-quick
-uname -r > /data/amneziawg/.kernel-version
-mkdir -p /data/amneziawg/tunnels
+- **Not durable across firmware updates.** A UCG firmware update reverts
+  `/lib/modules` to the stock `wireguard.ko`. `install-module.sh` re-asserts our
+  module on the next boot, but if udapi autoloads stock and brings a tunnel up
+  before `awg-boot.sh` runs, that one boot may run on stock (no obfuscation)
+  until the following reboot.
+- **Single point of obfuscation source:** Mongo schema (`ace.networkconf`,
+  fields `wireguard_id` / `purpose` / `vpn_type` / `wireguard_client_configuration_file`).
+  A UniFi update that renames these silently yields plain WireGuard.
+- **Built against stock headers, run on the vendor kernel.** The module compiles
+  against kernel.org 5.4.213 and hand-patches the vendor `net_device` / `sk_buff`
+  / `napi_struct` layouts to match (`build.sh` `patch_vendor_*`). A kernel bump
+  that changes any of those structs (or the offsets in the netdevice/skbuff
+  pads) needs the layout patches re-derived, or the module corrupts memory at
+  those offsets. Layer 7 of `awg-status.sh` catches the napi case at runtime.
 
-cp /data/amneziawg/amneziawg.rc.local /etc/rc.local
-chmod +x /etc/rc.local
+## Files
 
-systemctl daemon-reload
-systemctl start rc-local.service
-```
-
-Проверка:
-
-```bash
-systemctl status rc-local.service --no-pager
-lsmod | grep amneziawg
-journalctl -b -u rc-local.service --no-pager | tail -n 100
-```
-
-Если тоннелей ещё нет, это нормально:
-
-```bash
-/data/amneziawg/awg show
-```
-
-выведет пусто. В этом случае `rc.local` просто грузит модуль и создаёт `/data/amneziawg/tunnels/`.
-
-Если рядом лежат:
-
-- `/data/amneziawg/wg-shim`
-- `/data/amneziawg/install-wg-shim.sh`
-
-то этот же `rc.local` на каждом boot автоматически заново ставит bind mount на системный `wg`, так что UI-коннекты Amnezia продолжают перехватываться после reboot.
-
-## Отладка на роутере
-
-Проверить, что AWG-интерфейс жив:
-
-```bash
-IFACE="wgcltN"
-/data/amneziawg/awg show "$IFACE"
-/data/amneziawg/awg show "$IFACE" latest-handshakes
-/data/amneziawg/awg show "$IFACE" transfer
-```
-
-Проверить PBR:
-
-```bash
-IFACE="wgcltN"
-IPV4="$(ip -o -4 addr show dev "$IFACE" scope global | awk 'NR == 1 { print $4 }' | cut -d/ -f1)"
-IPV6="$(ip -o -6 addr show dev "$IFACE" scope global | awk 'NR == 1 { print $4 }' | cut -d/ -f1)"
-
-ip -4 rule show | grep "$IFACE"
-ip -6 rule show | grep "$IFACE"
-[ -n "$IPV4" ] && ip -4 route get 1.1.1.1 from "$IPV4"
-[ -n "$IPV6" ] && ip -6 route get 2606:4700:4700::1111 from "$IPV6"
-```
-
-Проверить shim:
-
-```bash
-IFACE="wgcltN"
-cat /data/wg-shim/wg-shim.log
-ls -l /data/wg-shim/iface-extra.d
-wg show all dump | grep "^${IFACE}"
-```
-
-## Откат
-
-Снять shim:
-
-```bash
-/data/amneziawg/uninstall-wg-shim.sh
-```
-
-Вернуть конкретный интерфейс обратно в stock WireGuard:
-
-```bash
-/data/amneziawg/restore-managed-iface.sh <iface>
-```
+- `build.sh` — patches + builds the renamed module (`patch_awg_*` functions).
+- `kmod/iface_junk.{c,h}` — the per-interface junk store.
+- `scripts/` — `install-module.sh`, `populate-junk.sh`, `awg-boot.sh`,
+  `awg-status.sh`, `awg.rc.local`, `awg-populate@.service`,
+  `99-amnezia-wgclt.rules`.
+- `scripts/legacy/` — the old bind-mount `wg-shim` path (deprecated; not used by
+  the amnezia-as-wireguard design).
+- `docs/plans/20260628-amnezia-as-wireguard.md` — implementation plan.

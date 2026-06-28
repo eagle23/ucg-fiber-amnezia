@@ -4,3 +4,6 @@
 output/wireguard-compare/
 output/amnezia-compare/
 output/vendor-amnezia-compare/
+output/*.ko
+output/awg
+output/awg-quick

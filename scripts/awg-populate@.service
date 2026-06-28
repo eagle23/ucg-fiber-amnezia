@@ -1,0 +1,11 @@
+[Unit]
+Description=Populate AmneziaWG iface_junk after %I appeared
+# Run after Mongo (ace) is reachable; populate-junk.sh also tolerates failure.
+After=network.target
+
+[Service]
+Type=oneshot
+# Authoritative full rebuild of iface_junk from Mongo. The instance name (%i =
+# the interface) is informational; the kernel re-applies junk to any plain
+# cold-started interface on write.
+ExecStart=/data/amneziawg/populate-junk.sh

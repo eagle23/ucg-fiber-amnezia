@@ -7,6 +7,10 @@ KERNEL_DIR="/build/linux-${KERNEL_VERSION}"
 OUTPUT_DIR="/build/output"
 AMNEZIAWG_MODULE_REPO="https://github.com/amnezia-vpn/amneziawg-linux-kernel-module.git"
 AMNEZIAWG_MODULE_REF="${AMNEZIAWG_MODULE_REF:-v1.0.20260611}"
+# amneziawg-tools (awg/awg-quick), rebuilt under genl family "wireguard" so they
+# drive our renamed module natively. udapi's UniFi-patched `wg` cannot configure
+# AmneziaWG (incompatible netlink ABI), so a thin wg-shim redirects setconf to
+# `awg`, which speaks the module's ABI correctly.
 AMNEZIAWG_TOOLS_REPO="https://github.com/amnezia-vpn/amneziawg-tools.git"
 AMNEZIAWG_TOOLS_REF="${AMNEZIAWG_TOOLS_REF:-v1.0.20260223}"
 
@@ -82,6 +86,29 @@ patch_vendor_skbuff_layout() {
         "${skbuff_h}"
     sed -i '/^[[:space:]]*__be16[[:space:]]*protocol;$/i\	char			__ucg_fiber_pad_before_skb_protocol[4];' \
         "${skbuff_h}"
+}
+
+patch_vendor_napi_layout() {
+    local netdevice_h="$1"
+
+    # UCG Fiber's 5.4.213-ui kernel is built with Felix Fietkau's work-based
+    # threaded-NAPI backport (CONFIG_THREADED_NAPI; confirmed by napi_workfn in
+    # /proc/kallsyms), which appends a `struct work_struct work;` to the END of
+    # struct napi_struct (right after napi_id). The module is compiled against
+    # the stock kernel.org 5.4.213 headers, which LACK this field. At runtime the
+    # vendor netif_napi_add()/netif_napi_del() (resolved to the running kernel)
+    # do INIT_WORK(&napi->work,...) and cancel_work_sync(&napi->work) at the
+    # vendor offset -- one slot past the embedded peer->napi -> they scribble into
+    # the next wg_peer field (OOB). At teardown that memory is NULL, surfacing as
+    # WARN_ON(!work->func) in __flush_work on every netif_napi_del (peer removal
+    # and module unload). Mirror the vendor layout so peer->napi is the correct
+    # size and the work lands inside napi; threaded mode stays off (we never set
+    # NAPI_STATE_THREADED), so the work is merely initialized, never queued.
+    perl -0pi -e 's@(^\s*unsigned int\s+napi_id;\s*\n)@${1}\tstruct work_struct\twork;\n@m' "${netdevice_h}"
+    if ! grep -A1 'unsigned int.*napi_id;' "${netdevice_h}" | grep -q 'struct work_struct.*work;'; then
+        echo "ERROR: patch_vendor_napi_layout did not append napi work field (struct changed?)" >&2
+        exit 1
+    fi
 }
 
 patch_awg_socket_ipv6_fallback() {
@@ -217,6 +244,77 @@ patch_awg_ctor_safe_slab_allocs() {
     perl -0pi -e 's@kmem_cache_zalloc\(node_cache, GFP_KERNEL\)@wg_allowedips_node_alloc()@g' "${allowedips_c}"
 }
 
+patch_awg_rename_to_wireguard() {
+    local kbuild="$1"
+    local uapi_h="$2"
+
+    # Register the module under the name "wireguard" so it fully displaces the
+    # stock wireguard.ko on the UCG: KBUILD_MODNAME drives the rtnl-link .kind,
+    # device_type.name, MODULE_ALIAS_RTNL_LINK, the netlink consistency check and
+    # pr_fmt. The composite-module name (<mod>-y / obj-... := <mod>.o) must match.
+    #
+    # CRITICAL: the composite variable amneziawg-y is also appended to from
+    # crypto/Kbuild.include (zinc crypto: blake2s/chacha20poly1305/curve25519)
+    # and compat/Kbuild.include (siphash/dst_cache/udp_tunnel/memneq). Renaming
+    # only the main Kbuild orphans those objects -> the module builds WITHOUT its
+    # own crypto and fails to load with "Unknown symbol zinc_*" once the stock
+    # wireguard (which exported them) is unloaded. So rename the variable in all
+    # kbuild fragments.
+    sed -i 's/\bamneziawg-y\b/wireguard-y/g' "${kbuild}" crypto/Kbuild.include compat/Kbuild.include
+    sed -i 's/:= amneziawg\.o$/:= wireguard.o/' "${kbuild}"
+    if grep -rq '\bamneziawg-y\b' "${kbuild}" crypto/Kbuild.include compat/Kbuild.include; then
+        echo "ERROR: stray amneziawg-y remains after rename (crypto/compat objects would be dropped)" >&2
+        exit 1
+    fi
+    if ! grep -q '^wireguard-y :=' "${kbuild}" || ! grep -q ':= wireguard\.o$' "${kbuild}"; then
+        echo "ERROR: Kbuild rename to wireguard did not apply" >&2
+        exit 1
+    fi
+    # genl family name + MODULE_ALIAS_GENL_FAMILY resolve through WG_GENL_NAME.
+    sed -i 's/#define WG_GENL_NAME "amneziawg"/#define WG_GENL_NAME "wireguard"/' "${uapi_h}"
+    if ! grep -q '#define WG_GENL_NAME "wireguard"' "${uapi_h}"; then
+        echo "ERROR: WG_GENL_NAME rename to wireguard did not apply" >&2
+        exit 1
+    fi
+}
+
+patch_awg_iface_junk() {
+    local kmod_dir="$1"
+    local kbuild="$2"
+    local device_c="$3"
+
+    # Drop in the per-interface junk store and add it to the composite module.
+    cp "${kmod_dir}/iface_junk.c" "${kmod_dir}/iface_junk.h" .
+    sed -i 's/^wireguard-y := \(.*\)$/wireguard-y := \1 iface_junk.o/' "${kbuild}"
+    if ! grep -q 'iface_junk\.o' "${kbuild}"; then
+        echo "ERROR: iface_junk.o not added to Kbuild" >&2
+        exit 1
+    fi
+    # Inject junk into the device the moment it is created, before the first
+    # packet, so boot-known tunnels obfuscate their very first handshake. Both
+    # the new and the 5.4-compat newlink paths funnel through wg_newlink().
+    if ! grep -q '#include "iface_junk.h"' "${device_c}"; then
+        sed -i '/#include "messages.h"/a #include "iface_junk.h"' "${device_c}"
+    fi
+    perl -0pi -e 's@\tnetif_threaded_enable\(dev\);\n\tret = register_netdevice\(dev\);@\twg_iface_junk_apply(wg);\n\tnetif_threaded_enable(dev);\n\tret = register_netdevice(dev);@s' "${device_c}"
+    if ! grep -q 'wg_iface_junk_apply(wg);' "${device_c}"; then
+        echo "ERROR: iface_junk newlink hook not injected into wg_newlink" >&2
+        exit 1
+    fi
+    # Expose the (static) device_list so the iface_junk param store-callback can
+    # re-apply junk to already-live interfaces (cold-start of post-boot tunnels).
+    if ! grep -q 'wg_device_list(void)' "${device_c}"; then
+        cat >>"${device_c}" <<'AWG_EOF'
+
+/* UCGF: accessor for the static device_list, used by iface_junk reapply. */
+struct list_head *wg_device_list(void)
+{
+	return &device_list;
+}
+AWG_EOF
+    fi
+}
+
 # ============================================================
 # Step 1: Prepare kernel headers
 # ============================================================
@@ -244,9 +342,9 @@ if [ "${RELEASE}" != "${EXPECTED}" ]; then
 fi
 
 # ============================================================
-# Step 2: Build AmneziaWG kernel module
+# Step 2: Build AmneziaWG kernel module (registered as "wireguard")
 # ============================================================
-echo "=== Building amneziawg.ko ==="
+echo "=== Building wireguard.ko (AmneziaWG renamed) ==="
 
 cd /build
 checkout_repo_ref /build/amneziawg-linux-kernel-module "${AMNEZIAWG_MODULE_REPO}" "${AMNEZIAWG_MODULE_REF}"
@@ -282,6 +380,11 @@ patch_vendor_netdevice_layout "${KERNEL_DIR}/include/linux/netdevice.h"
 # nesting helpers compute bogus marks and awg show blows up in nlmsg_trim().
 patch_vendor_skbuff_layout "${KERNEL_DIR}/include/linux/skbuff.h"
 
+# Patch 3c: vendor napi_struct has a trailing work_struct (CONFIG_THREADED_NAPI).
+# Without mirroring it, vendor netif_napi_del() flushes &napi->work past the
+# embedded peer->napi (OOB), warning in __flush_work on every peer teardown.
+patch_vendor_napi_layout "${KERNEL_DIR}/include/linux/netdevice.h"
+
 # Patch 4: UCG Fiber's kernel rejects the IPv6 UDP socket on bring-up, even
 # after interface creation works. Falling back to IPv4 keeps client use-cases
 # alive instead of aborting link-up in wg_open().
@@ -289,8 +392,14 @@ patch_awg_socket_ipv6_fallback socket.c
 
 # Patch 5: AWG's extended dump path trips nlmsg_trim() on this BSP during
 # "awg show". Keep the setconf path intact, but dump only the upstream-safe
-# core attrs for now.
+# core attrs for now. SECURITY-CRITICAL: if this silently fails to apply (e.g.
+# after an upstream bump rewrites the dump block), junk attrs would leak into
+# `wg show` and break the stock-wg/UI compatibility, so assert it applied.
 patch_awg_device_dump netlink.c
+if grep -q 'nla_put_u16(skb, WGDEVICE_A_JC' netlink.c; then
+    echo "ERROR: patch_awg_device_dump did not strip junk from the dump path (upstream source changed?)" >&2
+    exit 1
+fi
 
 # Patch 6: make module unload deterministic by unregistering any lingering
 # interfaces during module exit and waiting for deferred peer RCU frees before
@@ -306,29 +415,59 @@ patch_awg_unique_slab_names main.c allowedips.c peer.c
 # non-mergeable caches, but zero objects explicitly after kmem_cache_alloc().
 patch_awg_ctor_safe_slab_allocs allowedips.c peer.c
 
+# Patch 9: register the module as "wireguard" (rtnl-link type + genl family) so
+# it natively backs UI-created `ip link add type wireguard` interfaces and the
+# stock `wg` (which udapi uses for setconf/syncconf) talks straight to it.
+patch_awg_rename_to_wireguard Kbuild uapi/wireguard.h
+
+# Patch 10: add the per-interface junk store (iface_junk module param) and hook
+# it into wg_newlink so junk is applied before the first packet. Must run after
+# the rename patch (it edits the renamed wireguard-y line).
+patch_awg_iface_junk /build/kmod Kbuild device.c
+
 make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} KERNELDIR="${KERNEL_DIR}" -j"$(nproc)"
 
 # Verify vermagic
-VERMAGIC=$(modinfo amneziawg.ko 2>/dev/null | grep vermagic | awk '{print $2, $3, $4, $5, $6}' || true)
+VERMAGIC=$(modinfo wireguard.ko 2>/dev/null | grep vermagic | awk '{print $2, $3, $4, $5, $6}' || true)
 echo "Module vermagic: ${VERMAGIC}"
 
-cp amneziawg.ko "${OUTPUT_DIR}/"
-echo "Built: ${OUTPUT_DIR}/amneziawg.ko"
+# Self-contained check: the module must bundle its own zinc crypto, otherwise it
+# fails to load standalone with "Unknown symbol zinc_*" once stock wireguard is
+# unloaded. Assert there are no undefined zinc/crypto symbols.
+NM="${CROSS_COMPILE}nm"
+UNDEF_CRYPTO=$("${NM}" wireguard.ko 2>/dev/null | awk '$1 == "U" && $2 ~ /(zinc_|chacha20|poly1305|curve25519|blake2s)/ { print $2 }' || true)
+if [ -n "${UNDEF_CRYPTO}" ]; then
+    echo "ERROR: wireguard.ko has undefined crypto symbols (zinc not bundled):" >&2
+    echo "${UNDEF_CRYPTO}" >&2
+    exit 1
+fi
+echo "Crypto self-contained: no undefined zinc symbols"
+
+cp wireguard.ko "${OUTPUT_DIR}/"
+echo "Built: ${OUTPUT_DIR}/wireguard.ko"
 
 # ============================================================
-# Step 3: Build awg userspace tool
+# Step 3: Build awg userspace tool, renamed to genl family "wireguard"
 # ============================================================
-echo "=== Building awg userspace tool ==="
+echo "=== Building awg (amneziawg-tools, genl family wireguard) ==="
 
 cd /build
 checkout_repo_ref /build/amneziawg-tools "${AMNEZIAWG_TOOLS_REPO}" "${AMNEZIAWG_TOOLS_REF}"
 
-cd amneziawg-tools/src
+cd /build/amneziawg-tools/src
+# Rename the genl family the tools talk to (also used to match the rtnl-link
+# kind in ipc-linux.h), matching the renamed kernel module.
+TOOLS_UAPI="uapi/linux/linux/wireguard.h"
+sed -i 's/#define WG_GENL_NAME "amneziawg"/#define WG_GENL_NAME "wireguard"/' "${TOOLS_UAPI}"
+if ! grep -q '#define WG_GENL_NAME "wireguard"' "${TOOLS_UAPI}"; then
+    echo "ERROR: awg-tools WG_GENL_NAME rename did not apply" >&2
+    exit 1
+fi
 make CC="${CROSS_COMPILE}gcc" -j"$(nproc)"
 
 cp wg "${OUTPUT_DIR}/awg"
 cp wg-quick/linux.bash "${OUTPUT_DIR}/awg-quick"
-echo "Built: ${OUTPUT_DIR}/awg, ${OUTPUT_DIR}/awg-quick"
+echo "Built: ${OUTPUT_DIR}/awg, ${OUTPUT_DIR}/awg-quick (genl family wireguard)"
 
 # ============================================================
 # Done
