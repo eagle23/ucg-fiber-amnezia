@@ -184,16 +184,14 @@
 ### Task 8: Per-iface udev populator via systemd-run (cold-start)
 
 **Files:**
-- Create: `scripts/populate-one.sh`
 - Create: `scripts/awg-populate@.service` (systemd template, oneshot)
 - Create: `scripts/99-amnezia-wgclt.rules` (udev)
 
-- [ ] udev-правило: `SUBSYSTEM=="net", KERNEL=="wgclt*", ACTION=="add", ENV{SYSTEMD_WANTS}+="awg-populate@%k.service"` (НЕ прямой `RUN+=mongo` — udev убьёт по таймауту)
-- [ ] `awg-populate@.service` → `populate-one.sh %i`: извлечь `N` из `wgcltN`, Mongo по `wireguard_id=N`, merge записи в `iface_junk` (не затирая другие) → ядро применит ретроактивно (Task 5)
-- [ ] disabled/нет записи в Mongo → не писать junk (остаётся чистым WG)
-- [ ] установка правила+юнита (`/etc/udev/rules.d/`, `udevadm control --reload`) — документировать, делать в `awg-boot.sh`/install
-- [ ] verify (router): добавить новый vpn-client в UI → в пределах ~WG-ретрая (≤5с, known-window: 1-2 первых handshake чистые — для handshake-blocking провайдера ок) коннектится; `dmesg` подтверждает retroactive-apply
-- [ ] verify: merge не сломал запись `wgclt30`
+- [x] udev-правило: `SUBSYSTEM=="net", KERNEL=="wgclt*", ACTION=="add", ENV{SYSTEMD_WANTS}+="awg-populate@%k.service"` (НЕ прямой `RUN+=mongo` — udev убьёт по таймауту)
+- [x] `awg-populate@.service` → `populate-junk.sh` (полная авторитетная перезапись вместо per-iface merge — проще и идемпотентно); ядро применяет ретроактивно (Task 5)
+- [x] disabled/нет записи в Mongo → `populate-junk.sh` пишет только enabled → остаётся чистым WG
+- [ ] установка правила+юнита (`/etc/udev/rules.d/`, `udevadm control --reload`) — делается в install (Task 10)
+- [ ] verify (router): добавить новый vpn-client в UI → в пределах ~WG-ретрая (≤5с, known-window: 1-2 первых handshake чистые — для handshake-blocking провайдера ок) коннектится; `dmesg` подтверждает retroactive-apply (pending)
 
 ### Task 9: Health-check `awg-status.sh` + invariant
 
@@ -201,10 +199,10 @@
 - Create: `scripts/awg-status.sh`
 - Modify: `scripts/awg-boot.sh` (усилить guard)
 
-- [ ] `awg-status.sh`: наш ли модуль (есть `iface_junk`), genl-семья `wireguard`, карта `iface_junk`, per-iface состояние через стоковый `wg show` (интерфейс/handshake — НЕ junk), PBR, ifindex; вынести как единый smoke для всех verify
-- [ ] guard в `awg-boot.sh`: после install-module параметр всё ещё отсутствует → громкий лог + ненулевой exit
-- [ ] инвариант в README: «нет записи в `iface_junk` → junk=0 → обычный WireGuard» (безопасно для Teleport/site-to-site)
-- [ ] verify (router): `awg-status.sh` даёт корректную картину при поднятом `wgclt30`
+- [x] `awg-status.sh`: наш ли модуль (есть `iface_junk`), genl-семья `wireguard`, карта `iface_junk`, per-iface состояние через стоковый `wg show` (интерфейс/handshake — НЕ junk), PBR, ifindex; единый smoke для verify
+- [x] guard: `install-module.sh` (зовётся из `awg-boot.sh`) при отсутствии `iface_junk` после install → громкий лог + `exit 1`
+- [ ] инвариант в README: «нет записи в `iface_junk` → junk=0 → обычный WireGuard» (Task 12)
+- [ ] verify (router): `awg-status.sh` даёт корректную картину при поднятом `wgclt30` (pending)
 
 ### Task 10: Retire wg-shim (legacy) + Makefile/deploy fix
 

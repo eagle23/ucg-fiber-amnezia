@@ -1,0 +1,7 @@
+# AmneziaWG-as-wireguard: when udapi creates a wgcltN interface, (re)populate the
+# kernel iface_junk param from Mongo so the new tunnel picks up its junk params.
+#
+# We do NOT run mongo directly from RUN+= -- systemd-udevd kills RUN processes
+# (and their process group) on timeout, and mongo may not be ready at add time.
+# Instead we pull in a oneshot unit, which runs outside the udev event timeout.
+SUBSYSTEM=="net", KERNEL=="wgclt*", ACTION=="add", ENV{SYSTEMD_WANTS}+="awg-populate@%k.service"
