@@ -212,11 +212,11 @@
 - Modify: `README.md`
 - Modify (move): `scripts/wg-shim`, `install-wg-shim.sh`, `uninstall-wg-shim.sh`, `restore-managed-iface.sh`, `amneziawg.rc.local` → `scripts/legacy/`
 
-- [ ] поправить `Makefile` target `verify` под имя `wireguard` (был `amneziawg`)
-- [ ] обновить `deploy.sh`/`make deploy` под новый набор; убрать bind-mount-инструкции из основного README-потока
-- [ ] перенести shim-скрипты в `scripts/legacy/` с пометкой deprecated
-- [ ] задокументировать откат (вернуть сток `wireguard.ko`+`depmod`, снять udev-правило/юнит, убрать rc.local-хук)
-- [ ] verify: `make deploy` копирует корректный набор; README-команды воспроизводимы
+- [x] `Makefile` target `verify` под имя `wireguard` (проверка `iface_junk` + `awg-status.sh`); `compare-amnezia` → `wireguard.ko`
+- [x] `deploy.sh` переписан: недеструктивно (копирует модуль+скрипты, ставит udev-правило+systemd-юнит); деструктивный swap модуля — отдельной командой; `INSTALL_RC_LOCAL=1` для boot-хука; блок отката
+- [x] shim-скрипты → `scripts/legacy/` + `scripts/legacy/README.md` (deprecated); stale `output/*.ko`/`awg` сняты с трекинга + в `.gitignore`
+- [x] README переписан под amnezia-as-wireguard (build/deploy/activate/verify/rollback/инвариант/firmware-caveat)
+- [ ] verify (router): `make deploy` копирует корректный набор; команды воспроизводимы (pending)
 
 ### Task 11: Verify acceptance criteria
 
