@@ -224,10 +224,21 @@ patch_awg_rename_to_wireguard() {
     # Register the module under the name "wireguard" so it fully displaces the
     # stock wireguard.ko on the UCG: KBUILD_MODNAME drives the rtnl-link .kind,
     # device_type.name, MODULE_ALIAS_RTNL_LINK, the netlink consistency check and
-    # pr_fmt. The composite-module name (<mod>-y / obj-... := <mod>.o) must match,
-    # so both lines are renamed together and the artifact becomes wireguard.ko.
-    sed -i 's/^amneziawg-y :=/wireguard-y :=/' "${kbuild}"
+    # pr_fmt. The composite-module name (<mod>-y / obj-... := <mod>.o) must match.
+    #
+    # CRITICAL: the composite variable amneziawg-y is also appended to from
+    # crypto/Kbuild.include (zinc crypto: blake2s/chacha20poly1305/curve25519)
+    # and compat/Kbuild.include (siphash/dst_cache/udp_tunnel/memneq). Renaming
+    # only the main Kbuild orphans those objects -> the module builds WITHOUT its
+    # own crypto and fails to load with "Unknown symbol zinc_*" once the stock
+    # wireguard (which exported them) is unloaded. So rename the variable in all
+    # kbuild fragments.
+    sed -i 's/\bamneziawg-y\b/wireguard-y/g' "${kbuild}" crypto/Kbuild.include compat/Kbuild.include
     sed -i 's/:= amneziawg\.o$/:= wireguard.o/' "${kbuild}"
+    if grep -rq '\bamneziawg-y\b' "${kbuild}" crypto/Kbuild.include compat/Kbuild.include; then
+        echo "ERROR: stray amneziawg-y remains after rename (crypto/compat objects would be dropped)" >&2
+        exit 1
+    fi
     if ! grep -q '^wireguard-y :=' "${kbuild}" || ! grep -q ':= wireguard\.o$' "${kbuild}"; then
         echo "ERROR: Kbuild rename to wireguard did not apply" >&2
         exit 1
@@ -387,6 +398,18 @@ make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} KERNELDIR="${KERNEL_DIR}" -j"$(
 # Verify vermagic
 VERMAGIC=$(modinfo wireguard.ko 2>/dev/null | grep vermagic | awk '{print $2, $3, $4, $5, $6}' || true)
 echo "Module vermagic: ${VERMAGIC}"
+
+# Self-contained check: the module must bundle its own zinc crypto, otherwise it
+# fails to load standalone with "Unknown symbol zinc_*" once stock wireguard is
+# unloaded. Assert there are no undefined zinc/crypto symbols.
+NM="${CROSS_COMPILE}nm"
+UNDEF_CRYPTO=$("${NM}" wireguard.ko 2>/dev/null | awk '$1 == "U" && $2 ~ /(zinc_|chacha20|poly1305|curve25519|blake2s)/ { print $2 }' || true)
+if [ -n "${UNDEF_CRYPTO}" ]; then
+    echo "ERROR: wireguard.ko has undefined crypto symbols (zinc not bundled):" >&2
+    echo "${UNDEF_CRYPTO}" >&2
+    exit 1
+fi
+echo "Crypto self-contained: no undefined zinc symbols"
 
 cp wireguard.ko "${OUTPUT_DIR}/"
 echo "Built: ${OUTPUT_DIR}/wireguard.ko"
