@@ -88,6 +88,29 @@ patch_vendor_skbuff_layout() {
         "${skbuff_h}"
 }
 
+patch_vendor_napi_layout() {
+    local netdevice_h="$1"
+
+    # UCG Fiber's 5.4.213-ui kernel is built with Felix Fietkau's work-based
+    # threaded-NAPI backport (CONFIG_THREADED_NAPI; confirmed by napi_workfn in
+    # /proc/kallsyms), which appends a `struct work_struct work;` to the END of
+    # struct napi_struct (right after napi_id). The module is compiled against
+    # the stock kernel.org 5.4.213 headers, which LACK this field. At runtime the
+    # vendor netif_napi_add()/netif_napi_del() (resolved to the running kernel)
+    # do INIT_WORK(&napi->work,...) and cancel_work_sync(&napi->work) at the
+    # vendor offset -- one slot past the embedded peer->napi -> they scribble into
+    # the next wg_peer field (OOB). At teardown that memory is NULL, surfacing as
+    # WARN_ON(!work->func) in __flush_work on every netif_napi_del (peer removal
+    # and module unload). Mirror the vendor layout so peer->napi is the correct
+    # size and the work lands inside napi; threaded mode stays off (we never set
+    # NAPI_STATE_THREADED), so the work is merely initialized, never queued.
+    perl -0pi -e 's@(^\s*unsigned int\s+napi_id;\s*\n)@${1}\tstruct work_struct\twork;\n@m' "${netdevice_h}"
+    if ! grep -A1 'unsigned int.*napi_id;' "${netdevice_h}" | grep -q 'struct work_struct.*work;'; then
+        echo "ERROR: patch_vendor_napi_layout did not append napi work field (struct changed?)" >&2
+        exit 1
+    fi
+}
+
 patch_awg_socket_ipv6_fallback() {
     local socket_c="$1"
 
@@ -356,6 +379,11 @@ patch_vendor_netdevice_layout "${KERNEL_DIR}/include/linux/netdevice.h"
 # Patch 3b: vendor sk_buff layout differs too. Without this, inline netlink
 # nesting helpers compute bogus marks and awg show blows up in nlmsg_trim().
 patch_vendor_skbuff_layout "${KERNEL_DIR}/include/linux/skbuff.h"
+
+# Patch 3c: vendor napi_struct has a trailing work_struct (CONFIG_THREADED_NAPI).
+# Without mirroring it, vendor netif_napi_del() flushes &napi->work past the
+# embedded peer->napi (OOB), warning in __flush_work on every peer teardown.
+patch_vendor_napi_layout "${KERNEL_DIR}/include/linux/netdevice.h"
 
 # Patch 4: UCG Fiber's kernel rejects the IPv6 UDP socket on bring-up, even
 # after interface creation works. Falling back to IPv4 keeps client use-cases
