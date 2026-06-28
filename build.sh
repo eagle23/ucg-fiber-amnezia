@@ -6,7 +6,7 @@ EXTRAVERSION="-ui-ipq9574"
 KERNEL_DIR="/build/linux-${KERNEL_VERSION}"
 OUTPUT_DIR="/build/output"
 AMNEZIAWG_MODULE_REPO="https://github.com/amnezia-vpn/amneziawg-linux-kernel-module.git"
-AMNEZIAWG_MODULE_REF="${AMNEZIAWG_MODULE_REF:-v1.0.20260322}"
+AMNEZIAWG_MODULE_REF="${AMNEZIAWG_MODULE_REF:-v1.0.20260611}"
 AMNEZIAWG_TOOLS_REPO="https://github.com/amnezia-vpn/amneziawg-tools.git"
 AMNEZIAWG_TOOLS_REF="${AMNEZIAWG_TOOLS_REF:-v1.0.20260223}"
 
