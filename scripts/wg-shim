@@ -1,0 +1,43 @@
+#!/bin/sh
+# Thin wg-shim for the AmneziaWG-as-wireguard design.
+#
+# udapi's UniFi-patched `wg` cannot configure our module (incompatible netlink
+# ABI: it sends custom attributes that collide with AmneziaWG's). So for
+# wgclt* setconf/syncconf we redirect to `awg` (rebuilt under the same
+# "wireguard" genl family), which speaks the module's ABI natively, after
+# stripping UI-only config keys that `awg` doesn't understand. Every other
+# invocation (show, etc.) goes straight to the real `wg` -- our module registers
+# as the "wireguard" genl family, so `wg show` already sees it (no dump merge,
+# no interface-type conversion, no PBR repair needed).
+#
+# Junk obfuscation params are applied separately, kernel-side, via the
+# iface_junk module param (set at interface creation), so they survive the
+# `awg setconf` here (which carries no junk fields).
+set -u
+
+REAL_WG="${WG_SHIM_REAL:-/data/wg-shim/orig/wg}"
+AWG="${WG_SHIM_AWG:-/data/amneziawg/awg}"
+
+cmd="${1:-}"
+iface="${2:-}"
+
+case "${cmd}" in
+setconf | syncconf)
+	case "${iface}" in
+	wgclt*)
+		cfg="${3:-}"
+		if [ -n "${cfg}" ] && [ -f "${cfg}" ]; then
+			cleaned="$(mktemp)"
+			# Drop UI-only keys awg does not parse (e.g. ForcedHandshake).
+			grep -viE '^[[:space:]]*ForcedHandshake[[:space:]]*=' "${cfg}" >"${cleaned}"
+			"${AWG}" "${cmd}" "${iface}" "${cleaned}"
+			rc=$?
+			rm -f "${cleaned}"
+			exit ${rc}
+		fi
+		;;
+	esac
+	;;
+esac
+
+exec "${REAL_WG}" "$@"

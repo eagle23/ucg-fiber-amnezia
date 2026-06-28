@@ -7,8 +7,12 @@ KERNEL_DIR="/build/linux-${KERNEL_VERSION}"
 OUTPUT_DIR="/build/output"
 AMNEZIAWG_MODULE_REPO="https://github.com/amnezia-vpn/amneziawg-linux-kernel-module.git"
 AMNEZIAWG_MODULE_REF="${AMNEZIAWG_MODULE_REF:-v1.0.20260611}"
-# amneziawg-tools are no longer built (stock wg/wg-quick on the UCG suffice;
-# junk is injected kernel-side via the iface_junk module param).
+# amneziawg-tools (awg/awg-quick), rebuilt under genl family "wireguard" so they
+# drive our renamed module natively. udapi's UniFi-patched `wg` cannot configure
+# AmneziaWG (incompatible netlink ABI), so a thin wg-shim redirects setconf to
+# `awg`, which speaks the module's ABI correctly.
+AMNEZIAWG_TOOLS_REPO="https://github.com/amnezia-vpn/amneziawg-tools.git"
+AMNEZIAWG_TOOLS_REF="${AMNEZIAWG_TOOLS_REF:-v1.0.20260223}"
 
 ARCH="arm64"
 CROSS_COMPILE="aarch64-linux-gnu-"
@@ -251,26 +255,6 @@ patch_awg_rename_to_wireguard() {
     fi
 }
 
-patch_awg_netlink_compat() {
-    local netlink_c="$1"
-
-    # The UCG ships a UniFi-patched wireguard-tools whose `wg` sends a custom
-    # device-level attribute at index 9 (16 bytes), which collides with
-    # AmneziaWG's WGDEVICE_A_JC (NLA_U16). Under strict genl validation that
-    # length mismatch ("attribute type 9 has an invalid length") aborts the whole
-    # setconf, leaving the interface unconfigured. We don't need any AmneziaWG
-    # netlink attribute (junk comes from the iface_junk module param, not
-    # netlink), so relax validation to liberal: the incompatible attribute is
-    # skipped and the rest of the config (keys, peers, allowedips) applies.
-    # Confirmed on-router: setconf succeeds and the config is applied.
-    perl -0pi -e 's/\t\t\.cmd = WG_CMD_GET_DEVICE,\n/\t\t.cmd = WG_CMD_GET_DEVICE,\n\t\t.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,\n/' "${netlink_c}"
-    perl -0pi -e 's/\t\t\.cmd = WG_CMD_SET_DEVICE,\n/\t\t.cmd = WG_CMD_SET_DEVICE,\n\t\t.validate = GENL_DONT_VALIDATE_STRICT,\n/' "${netlink_c}"
-    if [ "$(grep -c 'GENL_DONT_VALIDATE_STRICT' "${netlink_c}")" -ne 2 ]; then
-        echo "ERROR: netlink validate relaxation not applied to both ops" >&2
-        exit 1
-    fi
-}
-
 patch_awg_iface_junk() {
     local kmod_dir="$1"
     local kbuild="$2"
@@ -413,13 +397,6 @@ patch_awg_rename_to_wireguard Kbuild uapi/wireguard.h
 # the rename patch (it edits the renamed wireguard-y line).
 patch_awg_iface_junk /build/kmod Kbuild device.c
 
-# Patch 11 (netlink-compat): the UCG's UniFi-patched `wg` sends a custom device
-# attribute (index 9, 16 bytes) that collides with AmneziaWG's WGDEVICE_A_JC and
-# trips strict genl validation, aborting setconf. Relax validation to liberal so
-# the incompatible attribute is skipped and stock `wg setconf` from udapi
-# configures the interface (junk comes from iface_junk, not netlink).
-patch_awg_netlink_compat netlink.c
-
 make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} KERNELDIR="${KERNEL_DIR}" -j"$(nproc)"
 
 # Verify vermagic
@@ -441,11 +418,28 @@ echo "Crypto self-contained: no undefined zinc symbols"
 cp wireguard.ko "${OUTPUT_DIR}/"
 echo "Built: ${OUTPUT_DIR}/wireguard.ko"
 
-# Userspace amneziawg-tools are intentionally NOT built: the UCG already ships
-# stock wg/wg-quick (wireguard-tools), udapi configures tunnels via
-# `wg setconf`/`wg syncconf`, and junk params are injected kernel-side from the
-# `iface_junk` module param. The renamed genl family makes stock `wg` talk to
-# this module directly, so no separate `awg` binary is needed.
+# ============================================================
+# Step 3: Build awg userspace tool, renamed to genl family "wireguard"
+# ============================================================
+echo "=== Building awg (amneziawg-tools, genl family wireguard) ==="
+
+cd /build
+checkout_repo_ref /build/amneziawg-tools "${AMNEZIAWG_TOOLS_REPO}" "${AMNEZIAWG_TOOLS_REF}"
+
+cd /build/amneziawg-tools/src
+# Rename the genl family the tools talk to (also used to match the rtnl-link
+# kind in ipc-linux.h), matching the renamed kernel module.
+TOOLS_UAPI="uapi/linux/linux/wireguard.h"
+sed -i 's/#define WG_GENL_NAME "amneziawg"/#define WG_GENL_NAME "wireguard"/' "${TOOLS_UAPI}"
+if ! grep -q '#define WG_GENL_NAME "wireguard"' "${TOOLS_UAPI}"; then
+    echo "ERROR: awg-tools WG_GENL_NAME rename did not apply" >&2
+    exit 1
+fi
+make CC="${CROSS_COMPILE}gcc" -j"$(nproc)"
+
+cp wg "${OUTPUT_DIR}/awg"
+cp wg-quick/linux.bash "${OUTPUT_DIR}/awg-quick"
+echo "Built: ${OUTPUT_DIR}/awg, ${OUTPUT_DIR}/awg-quick (genl family wireguard)"
 
 # ============================================================
 # Done
