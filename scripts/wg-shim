@@ -1,28 +1,41 @@
 #!/bin/sh
 # Thin wg-shim for the AmneziaWG-as-wireguard design.
 #
-# udapi's UniFi-patched `wg` cannot configure our module (incompatible netlink
-# ABI: it sends custom attributes that collide with AmneziaWG's). So for
-# wgclt* setconf/syncconf we redirect to `awg` (rebuilt under the same
-# "wireguard" genl family), which speaks the module's ABI natively, after
-# stripping UI-only config keys that `awg` doesn't understand. Every other
-# invocation (show, etc.) goes straight to the real `wg` -- our module registers
-# as the "wireguard" genl family, so `wg show` already sees it (no dump merge,
-# no interface-type conversion, no PBR repair needed).
+# Two jobs, both because udapi's UniFi-patched wireguard differs from our
+# AmneziaWG-as-"wireguard" module:
 #
-# Junk obfuscation params are applied separately, kernel-side, via the
-# iface_junk module param (set at interface creation), so they survive the
-# `awg setconf` here (which carries no junk fields).
+# 1. CONFIG (setconf/syncconf for wgclt*): udapi's UI-patched `wg` sends custom
+#    netlink attributes that collide with AmneziaWG's, so its setconf fails
+#    against our module. Redirect to `awg` (amneziawg-tools rebuilt under the
+#    same "wireguard" genl family), which speaks the module's ABI natively,
+#    after stripping UI-only config keys awg doesn't parse (e.g. ForcedHandshake).
+#
+# 2. STATUS (`wg show all dump`): UniFi's `wg` dump has an extra per-peer 10th
+#    field -- a "forced handshake" timestamp -- and udapi marks a tunnel
+#    "Established" (and only THEN installs its `default dev wgcltN proto VPN`
+#    route) based on it being fresh. Our module reports the standard 9 fields,
+#    so udapi never sees the signal and never routes the tunnel. We normalize
+#    the dump: for wgclt* peer rows with a live handshake, synthesize the 10th
+#    field = now. Once udapi sees this it sets the route itself -- no PBR repair,
+#    no manual route hacks needed.
+#
+# Everything else passes straight through to the real `wg` (our module is the
+# "wireguard" genl family, so plain `wg show` already works). Junk obfuscation
+# params are applied kernel-side via the iface_junk module param, independent of
+# the awg setconf here.
 set -u
 
 REAL_WG="${WG_SHIM_REAL:-/data/wg-shim/orig/wg}"
 AWG="${WG_SHIM_AWG:-/data/amneziawg/awg}"
+LOG="${WG_SHIM_LOG:-/data/wg-shim/shim.log}"
+
+log() { echo "$(date '+%H:%M:%S') $*" >>"${LOG}" 2>/dev/null; return 0; }
 
 cmd="${1:-}"
-iface="${2:-}"
 
 case "${cmd}" in
 setconf | syncconf)
+	iface="${2:-}"
 	case "${iface}" in
 	wgclt*)
 		cfg="${3:-}"
@@ -33,10 +46,27 @@ setconf | syncconf)
 			"${AWG}" "${cmd}" "${iface}" "${cleaned}"
 			rc=$?
 			rm -f "${cleaned}"
+			log "REDIRECT ${cmd} ${iface} -> awg (rc=${rc})"
 			exit ${rc}
 		fi
 		;;
 	esac
+	;;
+show)
+	# `wg show all dump`: normalize wgclt* peer rows to UniFi's 10-field format
+	# so udapi recognizes the tunnel as established and routes it itself.
+	if [ "${2:-}" = "all" ] && [ "${3:-}" = "dump" ]; then
+		now="$(date +%s)"
+		"${REAL_WG}" show all dump 2>/dev/null | awk -F'\t' -v OFS='\t' -v now="${now}" '
+			$1 ~ /^wgclt/ && NF >= 9 {
+				forced = (($6 + 0) > 0) ? now : 0
+				print $1, $2, $3, $4, $5, $6, $7, $8, $9, forced
+				next
+			}
+			{ print }
+		'
+		exit 0
+	fi
 	;;
 esac
 
